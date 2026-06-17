@@ -184,6 +184,155 @@ class TestDetectGitContext:
         assert result == ""
 
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+class TestFeishuCardSendPatch:
+    """Test _send_card and _patch_card methods on FeishuAdapter."""
+
+    @pytest.fixture
+    def adapter(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        mock_adapter = MagicMock(spec=FeishuAdapter)
+        mock_adapter._client = MagicMock()
+        mock_adapter._feishu_send_with_retry = AsyncMock(
+            return_value=MagicMock(
+                code=0,
+                data=MagicMock(message_id="msg_123"),
+            )
+        )
+        mock_adapter._finalize_send_result = MagicMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_123", error=None),
+        )
+        mock_adapter._send_card = FeishuAdapter._send_card.__get__(mock_adapter)
+        return mock_adapter
+
+    @pytest.mark.asyncio
+    async def test_send_card_sends_interactive_type(self, adapter):
+        result = await adapter._send_card(
+            chat_id="oc_123",
+            card={"config": {}, "elements": []},
+            reply_to="msg_orig",
+            metadata=None,
+        )
+        assert result.success
+        adapter._feishu_send_with_retry.assert_called_once()
+        call_kwargs = adapter._feishu_send_with_retry.call_args[1]
+        assert call_kwargs["msg_type"] == "interactive"
+        assert call_kwargs["chat_id"] == "oc_123"
+        assert call_kwargs["reply_to"] == "msg_orig"
+
+    @pytest.mark.asyncio
+    async def test_send_card_returns_message_id(self, adapter):
+        result = await adapter._send_card(
+            chat_id="oc_123",
+            card={"config": {}, "elements": []},
+        )
+        assert result.message_id == "msg_123"
+
+
+class TestFeishuSendCardIntegration:
+    @pytest.fixture
+    def mock_adapter(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = MagicMock(spec=FeishuAdapter)
+        adapter._client = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 65535
+        adapter.format_message = MagicMock(side_effect=lambda x: x.strip())
+        adapter.truncate_message = MagicMock(side_effect=lambda x, limit: [x])
+        adapter._send_card = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_card_1", error=None),
+        )
+        adapter._feishu_send_with_retry = AsyncMock(
+            return_value=MagicMock(code=0, data=MagicMock(message_id="msg_text_1")),
+        )
+        adapter._finalize_send_result = MagicMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_text_1", error=None),
+        )
+        adapter._build_outbound_payload = MagicMock(
+            return_value=("text", '{"text":"hello"}'),
+        )
+        adapter._response_succeeded = MagicMock(return_value=True)
+        adapter.send = FeishuAdapter.send.__get__(adapter)
+        adapter._card_mode_enabled = True
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_send_wraps_in_card(self, mock_adapter):
+        result = await mock_adapter.send(
+            chat_id="oc_123",
+            content="hello world",
+        )
+        assert result.success
+        mock_adapter._send_card.assert_called_once()
+        card_arg = mock_adapter._send_card.call_args[1]["card"]
+        assert card_arg["config"]["wide_screen_mode"] is True
+        assert card_arg["elements"][0]["content"] == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_on_card_failure(self, mock_adapter):
+        mock_adapter._send_card = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None, error="card failed"),
+        )
+        result = await mock_adapter.send(
+            chat_id="oc_123",
+            content="hello world",
+        )
+        assert result.success
+        mock_adapter._feishu_send_with_retry.assert_called()
+
+
+class TestFeishuEditCardIntegration:
+    @pytest.fixture
+    def mock_adapter(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = MagicMock(spec=FeishuAdapter)
+        adapter._client = MagicMock()
+        adapter.format_message = MagicMock(side_effect=lambda x: x.strip())
+        adapter._patch_card = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_123", error=None),
+        )
+        adapter._build_outbound_payload = MagicMock(
+            return_value=("text", '{"text":"hello"}'),
+        )
+        adapter._build_update_message_body = MagicMock()
+        adapter._build_update_message_request = MagicMock()
+        adapter._finalize_send_result = MagicMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_123", error=None),
+        )
+        adapter.edit_message = FeishuAdapter.edit_message.__get__(adapter)
+        adapter._card_mode_enabled = True
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_edit_wraps_in_card(self, mock_adapter):
+        result = await mock_adapter.edit_message(
+            chat_id="oc_123",
+            message_id="msg_123",
+            content="updated text",
+        )
+        assert result.success
+        mock_adapter._patch_card.assert_called_once()
+        card_arg = mock_adapter._patch_card.call_args[1]["card"]
+        assert card_arg["elements"][0]["content"] == "updated text"
+
+    @pytest.mark.asyncio
+    async def test_edit_falls_back_on_patch_failure(self, mock_adapter):
+        mock_adapter._patch_card = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None, error="patch failed"),
+        )
+        result = await mock_adapter.edit_message(
+            chat_id="oc_123",
+            message_id="msg_123",
+            content="updated text",
+        )
+        assert result.success
+
+
 from gateway.platforms.feishu_card import build_card_footer_line
 
 class TestBuildCardFooterLine:
