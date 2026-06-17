@@ -215,7 +215,8 @@ def build_card_footer_line(
     parts.append(f"${cost_usd:.4f}")
     if git_context:
         parts.append(f"@{git_context}")
-    parts.append(f"⏳{int(elapsed_seconds)}s")
+    _secs = int(elapsed_seconds)
+    parts.append(f"⏳{_secs // 60}m{_secs % 60}s" if _secs >= 60 else f"⏳{_secs}s")
     m = _model_short(model)
     if m:
         parts.append(f"🧠{m}")

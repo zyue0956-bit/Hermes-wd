@@ -454,6 +454,24 @@ class TestBuildCardFooterLine:
         )
         assert result == "📊 ↑100 | ↓200 | $0.0010 | ⏳5s | 🧠gpt-5.5"
 
+    def test_elapsed_over_60s_uses_min_format(self):
+        result = build_card_footer_line(
+            input_tokens=100,
+            output_tokens=200,
+            elapsed_seconds=375.0,
+            model="gpt-5.5",
+        )
+        assert "⏳6m15s" in result
+
+    def test_elapsed_exactly_60s(self):
+        result = build_card_footer_line(
+            input_tokens=100,
+            output_tokens=200,
+            elapsed_seconds=60.0,
+            model="gpt-5.5",
+        )
+        assert "⏳1m0s" in result
+
 
 class TestRunFooterMetrics:
     """Verify run.py passes the right fields to build_footer_line."""
