@@ -384,3 +384,57 @@ class TestRunFooterMetrics:
         new_params = {"input_tokens", "output_tokens", "cache_tokens", "cost_usd", "elapsed_seconds", "git_context"}
         actual_params = set(sig.parameters.keys())
         assert new_params.issubset(actual_params), f"Missing: {new_params - actual_params}"
+
+
+class TestFeishuEditMetadata:
+    """Test that edit_message accepts metadata for finalize footer."""
+
+    @pytest.fixture
+    def mock_adapter(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = MagicMock(spec=FeishuAdapter)
+        adapter._client = MagicMock()
+        adapter.format_message = MagicMock(side_effect=lambda x: x.strip())
+        adapter._patch_card = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_123", error=None),
+        )
+        adapter._build_outbound_payload = MagicMock(
+            return_value=("text", '{"text":"text"}'),
+        )
+        adapter._build_update_message_body = MagicMock()
+        adapter._build_update_message_request = MagicMock()
+        adapter._finalize_send_result = MagicMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_123", error=None),
+        )
+        adapter.edit_message = FeishuAdapter.edit_message.__get__(adapter)
+        adapter._card_mode_enabled = True
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_finalize_with_footer_metadata(self, mock_adapter):
+        result = await mock_adapter.edit_message(
+            chat_id="oc_123",
+            message_id="msg_123",
+            content="final response",
+            finalize=True,
+            metadata={
+                "footer_line": "📊 ↑48 | ↓11.1k | $0.01 | ⏳12s | 🧠gpt-5.5",
+                "status_text": "✅ 回复完毕",
+            },
+        )
+        assert result.success
+        card = mock_adapter._patch_card.call_args[1]["card"]
+        tags = [e["tag"] for e in card["elements"]]
+        assert "hr" in tags
+        assert "note" in tags
+
+    @pytest.mark.asyncio
+    async def test_edit_without_metadata_still_works(self, mock_adapter):
+        """Backward compat: edit_message without metadata kwarg."""
+        result = await mock_adapter.edit_message(
+            chat_id="oc_123",
+            message_id="msg_123",
+            content="streaming text",
+        )
+        assert result.success

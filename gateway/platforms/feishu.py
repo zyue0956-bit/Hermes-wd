@@ -1855,6 +1855,7 @@ class FeishuAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Feishu text/post message."""
         if not self._client:
@@ -1866,7 +1867,14 @@ class FeishuAdapter(BasePlatformAdapter):
         if getattr(self, "_card_mode_enabled", False):
             try:
                 from gateway.platforms.feishu_card import build_card_json
-                card = build_card_json(content=content)
+                _meta = metadata or {}
+                footer_line = _meta.get("footer_line") if finalize else None
+                status_text = _meta.get("status_text") if finalize else None
+                card = build_card_json(
+                    content=content,
+                    footer_line=footer_line,
+                    status_text=status_text,
+                )
                 result = await self._patch_card(message_id=message_id, card=card)
                 if result.success:
                     return result
