@@ -9540,6 +9540,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         footer_line=_footer_line,
                         status_text="✅ 回复完毕",
                     )
+                    # Consume pending ACK card if available
+                    _ack_id = getattr(_fc_adapter, '_pending_ack_cards', {}).pop(source.chat_id, None)
+                    if _ack_id:
+                        _ack_res = await _fc_adapter._patch_card(message_id=_ack_id, card=card)
+                        if _ack_res.success:
+                            return None
                     await _fc_adapter._send_card(
                         chat_id=source.chat_id,
                         card=card,
@@ -15786,7 +15792,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         _action = _a.get("current_tool") or _a.get("last_activity_desc")
                         if _action:
-                            _parts.append(str(_action))
+                            try:
+                                from gateway.platforms.feishu_card import get_tool_display
+                                _action = get_tool_display(str(_action))
+                            except Exception:
+                                _action = str(_action)
+                            _parts.append(_action)
                         if _parts:
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
