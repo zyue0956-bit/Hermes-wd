@@ -1790,6 +1790,7 @@ class FeishuAdapter(BasePlatformAdapter):
             try:
                 from gateway.platforms.feishu_card import build_card_json
                 card = build_card_json(content=formatted)
+                logger.info("[Feishu] Card mode: sending interactive card to %s", chat_id)
                 result = await self._send_card(
                     chat_id=chat_id,
                     card=card,
@@ -1797,6 +1798,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     metadata=metadata,
                 )
                 if result.success:
+                    logger.info("[Feishu] Card sent successfully: %s", result.message_id)
                     return result
                 logger.warning("[Feishu] Card send failed, falling back to text: %s", result.error)
             except Exception as exc:
