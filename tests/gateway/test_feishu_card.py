@@ -54,3 +54,46 @@ class TestGetToolDisplay:
     )
     def test_get_tool_display(self, tool_name, expected):
         assert get_tool_display(tool_name) == expected
+
+
+from gateway.platforms.feishu_card import parse_markdown_tables
+
+class TestParseMarkdownTables:
+    def test_no_table_returns_single_text(self):
+        result = parse_markdown_tables("just some text")
+        assert result == [("text", "just some text")]
+
+    def test_simple_table(self):
+        md = "before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\nafter"
+        result = parse_markdown_tables(md)
+        assert len(result) == 3
+        assert result[0] == ("text", "before")
+        assert result[1][0] == "table"
+        table = result[1][1]
+        assert table["columns"] == [
+            {"name": "col_0", "display_name": "A"},
+            {"name": "col_1", "display_name": "B"},
+        ]
+        assert table["rows"] == [
+            {"col_0": "1", "col_1": "2"},
+            {"col_0": "3", "col_1": "4"},
+        ]
+        assert result[2] == ("text", "after")
+
+    def test_empty_input(self):
+        result = parse_markdown_tables("")
+        assert result == [("text", "")]
+
+    def test_table_only(self):
+        md = "| X |\n|---|\n| 1 |"
+        result = parse_markdown_tables(md)
+        assert len(result) == 1
+        assert result[0][0] == "table"
+
+    def test_multiple_tables(self):
+        md = "| A |\n|---|\n| 1 |\n\nmiddle\n\n| B |\n|---|\n| 2 |"
+        result = parse_markdown_tables(md)
+        assert len(result) == 3
+        assert result[0][0] == "table"
+        assert result[1] == ("text", "middle")
+        assert result[2][0] == "table"
