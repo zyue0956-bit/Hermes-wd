@@ -9152,13 +9152,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
+
+                _footer_git_context = ""
+                _footer_cwd = os.environ.get("TERMINAL_CWD", "")
+                if _footer_cwd and source.platform == Platform.FEISHU:
+                    try:
+                        from gateway.platforms.feishu_card import detect_git_context
+                        _footer_git_context = detect_git_context(_footer_cwd)
+                    except Exception:
+                        pass
+
+                _turn_elapsed = time.time() - _msg_start_time
+
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
+                    cwd=_footer_cwd,
+                    input_tokens=agent_result.get("input_tokens", 0) or 0,
+                    output_tokens=agent_result.get("output_tokens", 0) or 0,
+                    cache_tokens=agent_result.get("cache_read_tokens", 0) or 0,
+                    cost_usd=agent_result.get("estimated_cost_usd", 0.0) or 0.0,
+                    elapsed_seconds=_turn_elapsed,
+                    git_context=_footer_git_context,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

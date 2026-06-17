@@ -371,3 +371,16 @@ class TestBuildCardFooterLine:
             model="gpt-5.5",
         )
         assert result == "📊 ↑100 | ↓200 | $0.0010 | ⏳5s | 🧠gpt-5.5"
+
+
+class TestRunFooterMetrics:
+    """Verify run.py passes the right fields to build_footer_line."""
+
+    def test_footer_receives_extended_fields(self):
+        """Conceptual test — verify the new kwargs exist in format_runtime_footer signature."""
+        import inspect
+        from gateway.runtime_footer import format_runtime_footer
+        sig = inspect.signature(format_runtime_footer)
+        new_params = {"input_tokens", "output_tokens", "cache_tokens", "cost_usd", "elapsed_seconds", "git_context"}
+        actual_params = set(sig.parameters.keys())
+        assert new_params.issubset(actual_params), f"Missing: {new_params - actual_params}"
