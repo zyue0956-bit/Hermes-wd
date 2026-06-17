@@ -13979,6 +13979,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if event_type not in {"tool.started",}:
                 return
 
+            # Feishu card mode: route tool status to stream consumer as ephemeral
+            # suffix instead of separate progress messages.
+            if (
+                source.platform == Platform.FEISHU
+                and _stream_consumer is not None
+                and hasattr(_stream_consumer, 'on_tool_status')
+                and getattr(self.adapters.get(source.platform), '_card_mode_enabled', False)
+            ):
+                from gateway.platforms.feishu_card import get_tool_display
+                tool_display = get_tool_display(tool_name or "")
+                _stream_consumer.on_tool_status(f"⏳ *{tool_display}...*")
+                return
+
             # Suppress tool-progress bubbles once the user has sent `stop`.
             # When the LLM response carries N parallel tool calls, the agent
             # fires N "tool.started" events back-to-back before checking for
