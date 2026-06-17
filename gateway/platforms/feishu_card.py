@@ -6,6 +6,9 @@ field formatting. Only imported by feishu.py; no upstream dependencies.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+
 
 def format_token_count(value: int) -> str:
     if value < 0:
@@ -144,3 +147,28 @@ def build_card_json(
         })
 
     return card
+
+
+def detect_git_context(cwd: str) -> str:
+    if not cwd:
+        return ""
+    try:
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd, capture_output=True, text=True, timeout=1,
+        )
+        if toplevel.returncode != 0:
+            return ""
+        repo_name = os.path.basename(toplevel.stdout.strip())
+
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=cwd, capture_output=True, text=True, timeout=1,
+        )
+        branch_name = branch.stdout.strip() if branch.returncode == 0 else ""
+        if not branch_name:
+            return ""
+
+        return f"{repo_name}:{branch_name}"
+    except (subprocess.TimeoutExpired, OSError):
+        return ""

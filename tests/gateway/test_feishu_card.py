@@ -153,3 +153,32 @@ class TestBuildCardJson:
             status_text="❌ 出错",
         )
         assert card["elements"][-1]["tag"] == "note"
+
+
+import subprocess
+from unittest.mock import patch, MagicMock
+from gateway.platforms.feishu_card import detect_git_context
+
+class TestDetectGitContext:
+    def test_in_git_repo(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+        subprocess.run(
+            ["git", "checkout", "-b", "feat/test"],
+            cwd=str(tmp_path), capture_output=True,
+        )
+        result = detect_git_context(str(tmp_path))
+        assert result == f"{tmp_path.name}:feat/test"
+
+    def test_not_a_git_repo(self, tmp_path):
+        result = detect_git_context(str(tmp_path))
+        assert result == ""
+
+    def test_empty_cwd(self):
+        result = detect_git_context("")
+        assert result == ""
+
+    @patch("gateway.platforms.feishu_card.subprocess.run")
+    def test_timeout_returns_empty(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=1)
+        result = detect_git_context("/some/path")
+        assert result == ""
