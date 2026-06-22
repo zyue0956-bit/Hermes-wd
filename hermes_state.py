@@ -105,7 +105,20 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
 
 T = TypeVar("T")
 
-DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+def _default_db_path() -> Path:
+    """Resolve state.db path at call time, not import time.
+
+    The old module-level constant was frozen at import, before test fixtures
+    could redirect HERMES_HOME — causing pytest sessions to leak into the
+    real ~/.hermes/state.db.  See zyue0956-bit/Hermes-wd#11.
+    """
+    return get_hermes_home() / "state.db"
+
+
+# Backward compat: `from hermes_state import DEFAULT_DB_PATH` still works
+# via __getattr__ (see bottom of module).  Direct attribute access on the
+# module also goes through __getattr__, so monkeypatch.setattr on
+# DEFAULT_DB_PATH is no longer needed — the function reads HERMES_HOME live.
 
 SCHEMA_VERSION = 16
 
@@ -678,7 +691,7 @@ class SessionDB:
     _CHECKPOINT_EVERY_N_WRITES = 50
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or _default_db_path()
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -4803,3 +4816,13 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
+
+
+# ---------------------------------------------------------------------------
+# Module-level __getattr__ — backward compat for DEFAULT_DB_PATH
+# ---------------------------------------------------------------------------
+
+def __getattr__(name: str):
+    if name == "DEFAULT_DB_PATH":
+        return _default_db_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
