@@ -419,6 +419,75 @@ class TestFeishuLiveCardIntegration:
         assert "chat_001" in adapter._pending_ack_cards
 
 
+class TestRecordPatchResult:
+    """Consecutive-failure degradation via record_patch_result."""
+
+    def test_success_resets_counter(self):
+        from gateway.platforms.feishu import LiveCardManager
+        mgr = LiveCardManager()
+        mgr.start("msg_001", started_at=0.0)
+        mgr.record_patch_result(False)
+        mgr.record_patch_result(False)
+        assert not mgr.degraded
+        mgr.record_patch_result(True)
+        assert mgr._consecutive_failures == 0
+        assert not mgr.degraded
+
+    def test_three_failures_triggers_degradation(self):
+        from gateway.platforms.feishu import LiveCardManager
+        mgr = LiveCardManager()
+        mgr.start("msg_001", started_at=0.0)
+        mgr.record_patch_result(False)
+        mgr.record_patch_result(False)
+        assert not mgr.degraded
+        mgr.record_patch_result(False)
+        assert mgr.degraded
+
+    def test_intermittent_failure_does_not_degrade(self):
+        from gateway.platforms.feishu import LiveCardManager
+        mgr = LiveCardManager()
+        mgr.start("msg_001", started_at=0.0)
+        mgr.record_patch_result(False)
+        mgr.record_patch_result(False)
+        mgr.record_patch_result(True)
+        mgr.record_patch_result(False)
+        mgr.record_patch_result(False)
+        assert not mgr.degraded
+
+    @pytest.mark.asyncio
+    async def test_send_progress_degrades_after_consecutive_failures(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        adapter = _make_adapter()
+        adapter._patch_card = AsyncMock(
+            return_value=SendResult(success=False, error="network error")
+        )
+        live = _make_live_card(state=LiveCardState.ACK_SENT, msg_id="ack_001")
+        adapter._live_cards["chat_001"] = live
+        adapter._pending_ack_cards["chat_001"] = "ack_001"
+
+        for _ in range(3):
+            await FeishuAdapter.send(adapter, "chat_001", "progress...")
+
+        assert adapter._live_cards["chat_001"].degraded
+
+    @pytest.mark.asyncio
+    async def test_edit_message_degrades_after_consecutive_failures(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        adapter = _make_adapter()
+        adapter._patch_card = AsyncMock(
+            return_value=SendResult(success=False, error="network error")
+        )
+        live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
+        adapter._live_cards["chat_001"] = live
+
+        for _ in range(3):
+            await FeishuAdapter.edit_message(
+                adapter, "chat_001", "msg_001", "streaming text..."
+            )
+
+        assert adapter._live_cards["chat_001"].degraded
+
+
 class TestLiveCardDegradation:
     """Task 13: Three-tier degradation."""
 

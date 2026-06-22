@@ -1432,7 +1432,7 @@ class LiveCardManager:
     __slots__ = (
         "state", "card_message_id", "accumulated_text", "tool_lines",
         "started_at", "last_tool", "last_patch_ts", "heartbeat_task",
-        "degraded",
+        "degraded", "_consecutive_failures",
     )
 
     def __init__(self) -> None:
@@ -1445,6 +1445,7 @@ class LiveCardManager:
         self.last_patch_ts: float = 0.0
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.degraded: bool = False
+        self._consecutive_failures: int = 0
 
     def start(self, card_message_id: str, *, started_at: float) -> None:
         self.state = LiveCardState.ACK_SENT
@@ -1455,6 +1456,7 @@ class LiveCardManager:
         self.last_tool = None
         self.last_patch_ts = 0.0
         self.degraded = False
+        self._consecutive_failures = 0
 
     def update_text(self, text: str) -> None:
         self.accumulated_text = text
@@ -1484,12 +1486,21 @@ class LiveCardManager:
         self.last_tool = None
         self.last_patch_ts = 0.0
         self.degraded = False
+        self._consecutive_failures = 0
         if self.heartbeat_task is not None:
             self.heartbeat_task.cancel()
             self.heartbeat_task = None
 
     def mark_degraded(self) -> None:
         self.degraded = True
+
+    def record_patch_result(self, success: bool) -> None:
+        if success:
+            self._consecutive_failures = 0
+        else:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self.mark_degraded()
 
     def should_throttle(self, *, now: float) -> bool:
         if self.last_patch_ts == 0.0:
@@ -1998,6 +2009,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     result = await self._patch_card(
                         message_id=live.card_message_id, card=card,
                     )
+                    live.record_patch_result(result.success)
                     if result.success:
                         live.last_patch_ts = time.monotonic()
                     return result
@@ -2129,6 +2141,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 result = await self._patch_card(
                     message_id=live.card_message_id, card=card,
                 )
+                live.record_patch_result(result.success)
                 if result.success:
                     live.last_patch_ts = time.monotonic()
                 return result
