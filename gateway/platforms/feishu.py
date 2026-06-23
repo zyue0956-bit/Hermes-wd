@@ -2003,7 +2003,8 @@ class FeishuAdapter(BasePlatformAdapter):
             is_final = bool(_meta.get("footer_line") or _meta.get("status_text"))
             _is_gw_heartbeat = formatted.lstrip().startswith("⏳ Working")
 
-            if not is_final and not _is_gw_heartbeat:
+            _is_system_msg = formatted.lstrip().startswith("💾")
+            if not is_final and not _is_gw_heartbeat and not _is_system_msg:
                 if live.accumulated_text:
                     live.accumulated_text += "\n\n" + formatted
                 else:
