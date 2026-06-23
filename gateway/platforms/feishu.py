@@ -2143,15 +2143,17 @@ class FeishuAdapter(BasePlatformAdapter):
 
         content = self.format_message(content)
 
-        # Live card interception — streaming text updates (skip gateway heartbeat)
+        # Live card interception — streaming text updates (skip gateway heartbeat & system msgs)
         _meta = metadata or {}
         live = self._live_cards.get(chat_id)
         _is_gw_heartbeat = content.lstrip().startswith("⏳ Working")
+        _is_system_msg = content.lstrip().startswith("💾")
         if (
             live
             and live.state in (LiveCardState.ACK_SENT, LiveCardState.LIVE)
             and not live.degraded
             and not _is_gw_heartbeat
+            and not _is_system_msg
         ):
             _is_finalize = finalize and (_meta.get("footer_line") or _meta.get("status_text"))
             if _is_finalize:
