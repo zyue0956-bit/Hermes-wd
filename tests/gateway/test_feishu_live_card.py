@@ -166,6 +166,15 @@ class TestLiveCardManager:
         assert mgr.last_tool == "CustomTool"
         assert len(mgr.tool_lines) == 1
 
+    def test_tool_lines_capped_at_max(self):
+        from gateway.platforms.feishu import LiveCardManager
+        mgr = LiveCardManager()
+        mgr.start("msg_001", started_at=100.0)
+        for i in range(30):
+            mgr.append_tool("Read")
+        assert len(mgr.tool_lines) <= mgr._MAX_TOOL_LINES + 1
+        assert mgr.tool_lines[0] == "..."
+
     def test_reset_clears_all(self):
         from gateway.platforms.feishu import LiveCardManager, LiveCardState
         mgr = LiveCardManager()
@@ -401,7 +410,7 @@ class TestFeishuLiveCardIntegration:
         )
 
     @pytest.mark.asyncio
-    async def test_send_non_final_suppressed(self):
+    async def test_send_non_final_accumulates_and_patches(self):
         from gateway.platforms.feishu import (
             FeishuAdapter, LiveCardState,
         )
@@ -416,9 +425,9 @@ class TestFeishuLiveCardIntegration:
 
         assert result.success
         assert result.message_id == "ack_001"
-        # ACK card preserved, _patch_card not called (suppressed)
         assert "chat_001" in adapter._pending_ack_cards
-        adapter._patch_card.assert_not_called()
+        assert "Reading config.yaml..." in adapter._live_cards["chat_001"].accumulated_text
+        adapter._patch_card.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_send_gateway_heartbeat_passes_through(self):
@@ -515,6 +524,96 @@ class TestLiveCardDegradation:
         assert result.success
         # Should have consumed the ACK card via original path
         assert "chat_001" not in adapter._pending_ack_cards
+
+
+class TestPatchLiveCardThrottled:
+    """_patch_live_card_throttled and on_tool_progress."""
+
+    @pytest.mark.asyncio
+    async def test_patch_throttled_skips_when_recent(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        adapter = _make_adapter()
+        live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
+        live.last_patch_ts = time.monotonic()
+        adapter._live_cards["chat_001"] = live
+
+        await FeishuAdapter._patch_live_card_throttled(adapter, "chat_001")
+        adapter._patch_card.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patch_throttled_patches_when_stale(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        adapter = _make_adapter()
+        live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
+        live.last_patch_ts = 0.0
+        adapter._live_cards["chat_001"] = live
+
+        await FeishuAdapter._patch_live_card_throttled(adapter, "chat_001")
+        adapter._patch_card.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_patch_throttled_noop_when_degraded(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        adapter = _make_adapter()
+        live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
+        live.mark_degraded()
+        adapter._live_cards["chat_001"] = live
+
+        await FeishuAdapter._patch_live_card_throttled(adapter, "chat_001")
+        adapter._patch_card.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patch_throttled_noop_when_idle(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState, LiveCardManager
+        adapter = _make_adapter()
+        live = LiveCardManager()
+        adapter._live_cards["chat_001"] = live
+
+        await FeishuAdapter._patch_live_card_throttled(adapter, "chat_001")
+        adapter._patch_card.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patch_throttled_records_failure(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        adapter = _make_adapter()
+        adapter._patch_card = AsyncMock(
+            return_value=SendResult(success=False, error="network")
+        )
+        live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
+        live.last_patch_ts = 0.0
+        adapter._live_cards["chat_001"] = live
+
+        await FeishuAdapter._patch_live_card_throttled(adapter, "chat_001")
+        assert live._consecutive_failures == 1
+
+    def test_on_tool_progress_appends_tool(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        adapter = _make_adapter()
+        live = _make_live_card(state=LiveCardState.ACK_SENT, msg_id="ack_001")
+        adapter._live_cards["chat_001"] = live
+        adapter._loop = None
+
+        FeishuAdapter.on_tool_progress(adapter, "Read", "chat_001")
+        assert live.last_tool == "Read"
+        assert len(live.tool_lines) == 1
+        assert "阅读文件" in live.tool_lines[0]
+
+    def test_on_tool_progress_skips_degraded(self):
+        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        adapter = _make_adapter()
+        live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
+        live.mark_degraded()
+        adapter._live_cards["chat_001"] = live
+
+        FeishuAdapter.on_tool_progress(adapter, "Read", "chat_001")
+        assert len(live.tool_lines) == 0
+
+    def test_on_tool_progress_skips_no_live_card(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        adapter = _make_adapter()
+        adapter._live_cards = {}
+        # Should not raise
+        FeishuAdapter.on_tool_progress(adapter, "Read", "chat_001")
 
 
 class TestFullLifecycle:

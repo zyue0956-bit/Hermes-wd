@@ -1463,6 +1463,8 @@ class LiveCardManager:
         if self.state == LiveCardState.ACK_SENT:
             self.state = LiveCardState.LIVE
 
+    _MAX_TOOL_LINES = 20
+
     def append_tool(self, tool_name: str) -> None:
         from gateway.platforms.feishu_card import TOOL_SEMANTICS
         self.last_tool = tool_name
@@ -1475,6 +1477,8 @@ class LiveCardManager:
             self.tool_lines.append(f"{icon} {entry[1]}")
         else:
             self.tool_lines.append(f"🔧 {tool_name}")
+        if len(self.tool_lines) > self._MAX_TOOL_LINES:
+            self.tool_lines = ["..."] + self.tool_lines[-self._MAX_TOOL_LINES:]
         if self.state == LiveCardState.ACK_SENT:
             self.state = LiveCardState.LIVE
 
@@ -3573,6 +3577,43 @@ class FeishuAdapter(BasePlatformAdapter):
                     logger.debug("[Feishu] LiveCard heartbeat patch failed: %s", exc)
         except asyncio.CancelledError:
             pass
+
+    async def _patch_live_card_throttled(self, chat_id: str) -> None:
+        """Throttle-respecting card patch for tool progress updates."""
+        live = self._live_cards.get(chat_id)
+        if not live or live.degraded:
+            return
+        if live.state not in (LiveCardState.ACK_SENT, LiveCardState.LIVE):
+            return
+        now = time.monotonic()
+        if live.should_throttle(now=now):
+            return
+        card = live.build_card(now=now)
+        result = await self._patch_card(
+            message_id=live.card_message_id, card=card,
+        )
+        live.record_patch_result(result.success)
+        if result.success:
+            live.last_patch_ts = time.monotonic()
+
+    def on_tool_progress(self, tool_name: str, chat_id: str) -> None:
+        """Called by gateway progress_callback for live card tool tracking.
+
+        Appends the tool to the live card's tool chain and schedules an
+        immediate (throttle-respecting) card patch via the event loop.
+        Called from the agent's worker thread — bridges to async via
+        _submit_on_loop.
+        """
+        live = self._live_cards.get(chat_id)
+        if not live or live.degraded:
+            return
+        if live.state not in (LiveCardState.ACK_SENT, LiveCardState.LIVE):
+            return
+        live.append_tool(tool_name)
+        logger.debug("[Feishu] LiveCard tool progress: %s → %s", chat_id, tool_name)
+        loop = self._loop
+        if loop is not None:
+            self._submit_on_loop(loop, self._patch_live_card_throttled(chat_id))
 
     # =========================================================================
     # Webhook server and security
