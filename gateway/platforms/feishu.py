@@ -2004,7 +2004,22 @@ class FeishuAdapter(BasePlatformAdapter):
             _is_gw_heartbeat = formatted.lstrip().startswith("⏳ Working")
 
             if not is_final and not _is_gw_heartbeat:
-                logger.debug("[Feishu] LiveCard suppressed non-final send: %s", chat_id)
+                if live.accumulated_text:
+                    live.accumulated_text += "\n\n" + formatted
+                else:
+                    live.accumulated_text = formatted
+                if live.state == LiveCardState.ACK_SENT:
+                    live.state = LiveCardState.LIVE
+                logger.debug("[Feishu] LiveCard intercepted commentary send: %s", chat_id)
+                if not live.should_throttle(now=time.monotonic()):
+                    card = live.build_card(now=time.monotonic())
+                    result = await self._patch_card(
+                        message_id=live.card_message_id, card=card,
+                    )
+                    live.record_patch_result(result.success)
+                    if result.success:
+                        live.last_patch_ts = time.monotonic()
+                    return result
                 return SendResult(success=True, message_id=live.card_message_id)
 
             if is_final:
@@ -2128,6 +2143,7 @@ class FeishuAdapter(BasePlatformAdapter):
         content = self.format_message(content)
 
         # Live card interception — streaming text updates (skip gateway heartbeat)
+        _meta = metadata or {}
         live = self._live_cards.get(chat_id)
         _is_gw_heartbeat = content.lstrip().startswith("⏳ Working")
         if (
@@ -2136,18 +2152,46 @@ class FeishuAdapter(BasePlatformAdapter):
             and not live.degraded
             and not _is_gw_heartbeat
         ):
-            live.update_text(content)
-            logger.debug("[Feishu] LiveCard intercepted edit: %s", chat_id)
-            if not live.should_throttle(now=time.monotonic()):
-                card = live.build_card(now=time.monotonic())
-                result = await self._patch_card(
-                    message_id=live.card_message_id, card=card,
-                )
-                live.record_patch_result(result.success)
-                if result.success:
-                    live.last_patch_ts = time.monotonic()
-                return result
-            return SendResult(success=True, message_id=live.card_message_id)
+            _is_finalize = finalize and (_meta.get("footer_line") or _meta.get("status_text"))
+            if _is_finalize:
+                try:
+                    from gateway.platforms.feishu_card import build_card_json
+                    card = build_card_json(
+                        content=content,
+                        footer_line=_meta.get("footer_line"),
+                        status_text=_meta.get("status_text"),
+                    )
+                    if live.heartbeat_task is not None:
+                        live.heartbeat_task.cancel()
+                        try:
+                            await live.heartbeat_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        live.heartbeat_task = None
+                    result = await self._patch_card(
+                        message_id=live.card_message_id, card=card,
+                    )
+                    self._live_cards.pop(chat_id, None)
+                    live.reset()
+                    logger.info("[Feishu] LiveCard finalized via edit: %s", chat_id)
+                    if result.success:
+                        return result
+                    logger.warning("[Feishu] LiveCard final edit patch failed: %s", result.error)
+                except Exception as exc:
+                    logger.warning("[Feishu] LiveCard finalize via edit failed: %s", exc)
+            else:
+                live.update_text(content)
+                logger.debug("[Feishu] LiveCard intercepted edit: %s", chat_id)
+                if not live.should_throttle(now=time.monotonic()):
+                    card = live.build_card(now=time.monotonic())
+                    result = await self._patch_card(
+                        message_id=live.card_message_id, card=card,
+                    )
+                    live.record_patch_result(result.success)
+                    if result.success:
+                        live.last_patch_ts = time.monotonic()
+                    return result
+                return SendResult(success=True, message_id=live.card_message_id)
 
         # Card mode: patch as interactive card
         if getattr(self, "_card_mode_enabled", False):

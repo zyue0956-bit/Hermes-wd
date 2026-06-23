@@ -9543,6 +9543,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 and _streamed_msg_id
                                 and getattr(_foot_adapter, '_card_mode_enabled', False)
                             ):
+                                try:
+                                    from gateway.platforms.feishu_card import build_card_footer_line
+                                    _footer_line = build_card_footer_line(
+                                        input_tokens=agent_result.get("input_tokens", 0) or 0,
+                                        output_tokens=agent_result.get("output_tokens", 0) or 0,
+                                        cache_tokens=agent_result.get("cache_read_tokens", 0) or 0,
+                                        cost_usd=agent_result.get("estimated_cost_usd", 0.0) or 0.0,
+                                        git_context=_footer_git_context,
+                                        elapsed_seconds=_turn_elapsed,
+                                        model=agent_result.get("model") or "",
+                                        context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+                                        context_length=agent_result.get("context_length") or 0,
+                                    )
+                                except Exception:
+                                    pass
                                 await _foot_adapter.edit_message(
                                     chat_id=source.chat_id,
                                     message_id=_streamed_msg_id,
