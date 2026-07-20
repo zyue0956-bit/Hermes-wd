@@ -332,8 +332,22 @@ def test_stalled_status_is_derived_from_child_activity_and_can_recover():
     gate.set()
 
 
+@pytest.mark.parametrize("workspace_path", [None, "/definitely/missing/hermes-workspace"])
+def test_write_dispatch_rejects_unavailable_workspace(workspace_path):
+    result = ad.dispatch_async_delegation(
+        goal="unsafe write", context=None, toolsets=["file"], role="leaf",
+        model="m", session_key="", runner=lambda: {"status": "completed"},
+        workspace_path=workspace_path, workspace_mode="write",
+    )
+    assert result["status"] == "rejected"
+    assert result["reason_code"] == "workspace_unavailable"
+    assert ad.active_count() == 0
+
+
 def test_workspace_lock_allows_read_read_and_different_workspaces(tmp_path):
     gate = threading.Event()
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "other").mkdir()
     kwargs = dict(
         context=None, toolsets=["web"], role="leaf", model="m", session_key="",
         runner=lambda: (gate.wait(timeout=5) or {"status": "completed"}),
@@ -360,6 +374,7 @@ def test_workspace_lock_allows_read_read_and_different_workspaces(tmp_path):
 )
 def test_workspace_lock_rejects_conflicting_modes(tmp_path, first_mode, second_mode):
     gate = threading.Event()
+    (tmp_path / "repo").mkdir()
     kwargs = dict(
         context=None, toolsets=None, role="leaf", model="m", session_key="",
         runner=lambda: (gate.wait(timeout=5) or {"status": "completed"}),
@@ -379,6 +394,7 @@ def test_workspace_lock_rejects_conflicting_modes(tmp_path, first_mode, second_m
 
 
 def test_workspace_lock_is_released_after_completion(tmp_path):
+    (tmp_path / "repo").mkdir()
     repo = str(tmp_path / "repo")
     first = ad.dispatch_async_delegation(
         goal="first", context=None, toolsets=None, role="leaf", model="m",
@@ -404,6 +420,8 @@ def test_session_owner_filters_listing_status_and_cancel(tmp_path):
     handles = []
 
     for index, owner in enumerate(("session:a", "session:b")):
+        (tmp_path / owner).mkdir()
+
         def runner(i=index):
             gates[i].wait(timeout=5)
             return {"status": "interrupted" if interrupted[i] else "completed"}
@@ -485,6 +503,7 @@ def test_workspace_lock_rejects_ancestor_descendant_overlap(
     tmp_path, first_suffix, second_suffix
 ):
     gate = threading.Event()
+    (tmp_path / "repo" / "sub").mkdir(parents=True)
     root = str(tmp_path / "repo")
     kwargs = dict(
         context=None, toolsets=["file"], role="leaf", model="m", session_key="",
@@ -501,6 +520,103 @@ def test_workspace_lock_rejects_ancestor_descendant_overlap(
     assert second["status"] == "rejected"
     assert second["reason_code"] == "workspace_locked"
     gate.set()
+
+
+@pytest.mark.parametrize(
+    ("child_statuses", "expected"),
+    [
+        (["completed", "completed"], "completed"),
+        (["interrupted", "interrupted"], "interrupted"),
+        (["completed", "interrupted"], "interrupted"),
+        (["completed", "error"], "error"),
+    ],
+)
+def test_batch_terminal_status_preserves_child_outcomes(child_statuses, expected):
+    result = ad.dispatch_async_delegation_batch(
+        goals=[f"task-{i}" for i in range(len(child_statuses))],
+        context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {
+            "results": [
+                {"task_index": i, "status": status}
+                for i, status in enumerate(child_statuses)
+            ]
+        },
+    )
+    event = _drain_one()
+    assert event is not None
+    assert event["delegation_id"] == result["delegation_id"]
+    assert event["status"] == expected
+    snapshot = ad.get_async_delegation(result["delegation_id"])
+    assert snapshot is not None
+    assert snapshot["status"] == expected
+
+
+def test_cancel_completion_race_returns_completed_truth():
+    runner_gate = threading.Event()
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    cancel_result = {}
+
+    def runner():
+        runner_gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def interrupt_fn():
+        callback_started.set()
+        callback_release.wait(timeout=5)
+
+    handle = ad.dispatch_async_delegation(
+        goal="race", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, interrupt_fn=interrupt_fn,
+    )["delegation_id"]
+
+    thread = threading.Thread(
+        target=lambda: cancel_result.update(ad.interrupt_async_delegation(handle))
+    )
+    thread.start()
+    assert callback_started.wait(timeout=2)
+    runner_gate.set()
+    event = _drain_one()
+    assert event is not None and event["status"] == "completed"
+    callback_release.set()
+    thread.join(timeout=2)
+
+    assert cancel_result["status"] == "completed"
+    assert cancel_result["active"] is False
+
+
+def test_cancel_callback_error_after_completion_returns_completed_truth():
+    runner_gate = threading.Event()
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    cancel_result = {}
+
+    def runner():
+        runner_gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def interrupt_fn():
+        callback_started.set()
+        callback_release.wait(timeout=5)
+        raise RuntimeError("late failure")
+
+    handle = ad.dispatch_async_delegation(
+        goal="race error", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, interrupt_fn=interrupt_fn,
+    )["delegation_id"]
+    thread = threading.Thread(
+        target=lambda: cancel_result.update(ad.interrupt_async_delegation(handle))
+    )
+    thread.start()
+    assert callback_started.wait(timeout=2)
+    runner_gate.set()
+    event = _drain_one()
+    assert event is not None and event["status"] == "completed"
+    callback_release.set()
+    thread.join(timeout=2)
+
+    assert cancel_result["status"] == "completed"
+    assert cancel_result["active"] is False
 
 
 def test_completed_records_pruned_to_cap():

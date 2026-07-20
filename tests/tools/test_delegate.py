@@ -2903,6 +2903,25 @@ class TestDelegationLifecycleIntegration:
         dt._clear_child_workspace_override(child)
         assert "cwd" not in resolve_task_overrides("sa-workspace-test")
 
+    def test_write_delegation_rejects_missing_authoritative_workspace(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        with patch.object(dt, "_resolve_workspace_hint", return_value=None), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+             patch.object(dt, "_build_child_agent") as build_child:
+            result = json.loads(dt.delegate_task(
+                goal="edit code", toolsets=["file"], background=True,
+                parent_agent=parent,
+            ))
+
+        assert "authoritative workspace" in result["error"]
+        build_child.assert_not_called()
+
     def test_workspace_mode_is_read_only_for_explicit_read_toolsets(self):
         from tools.delegate_tool import _resolve_workspace_mode
 

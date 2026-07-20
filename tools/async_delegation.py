@@ -236,9 +236,8 @@ def _build_delegation_record(
         "cancel_requested": False,
         "workspace_path": normalized_workspace,
         "workspace_mode": (
-            ("read" if workspace_mode == "read" else "write")
-            if normalized_workspace else None
-        ),
+            "read" if workspace_mode == "read" else "write"
+        ) if workspace_mode is not None else None,
     }
     if extra:
         record.update(extra)
@@ -250,6 +249,15 @@ def _admit_record(
 ) -> Optional[Dict[str, Any]]:
     """Atomically enforce workspace/capacity limits and insert one record."""
     with _records_lock:
+        workspace_path = record.get("workspace_path")
+        if record.get("workspace_mode") == "write" and (
+            not workspace_path or not os.path.isdir(str(workspace_path))
+        ):
+            return {
+                "status": "rejected",
+                "reason_code": "workspace_unavailable",
+                "error": "Write delegation requires an authoritative existing workspace.",
+            }
         holder = _workspace_conflict_locked(
             record.get("workspace_path"), record.get("workspace_mode")
         )
@@ -567,12 +575,17 @@ def dispatch_async_delegation_batch(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
             child_results = combined.get("results") or []
-            if child_results and all(
-                (r.get("status") not in ("completed", "success"))
-                for r in child_results
-            ):
+            child_statuses = {
+                str(result.get("status") or "").lower()
+                for result in child_results
+                if isinstance(result, dict)
+            }
+            if child_statuses & {"error", "failed", "failure"}:
+                status = "error"
+            elif child_statuses & {"interrupted", "cancelled", "canceled"}:
+                status = "interrupted"
+            elif child_results and not child_statuses <= {"completed", "success"}:
                 status = "error"
             else:
                 status = "completed"
@@ -746,19 +759,50 @@ def interrupt_async_delegation(
         return snapshot
 
     assert callable(fn)
+    callback_error: Optional[Exception] = None
     try:
         fn()
     except Exception as exc:
-        with _records_lock:
-            current = _records.get(delegation_id)
-            if current is not None and current is record and _is_active(current):
+        callback_error = exc
+
+    with _records_lock:
+        current = _records.get(delegation_id)
+        if current is None or current is not record:
+            current_record = None
+            terminal_record = None
+        elif not _is_active(current):
+            current_record = current
+            terminal_record = dict(current)
+        else:
+            current_record = current
+            terminal_record = None
+            if callback_error is not None:
                 current["cancel_requested"] = False
-        logger.debug("interrupt_async_delegation(%s) failed: %s", delegation_id, exc)
+
+    if terminal_record is not None:
+        snapshot = _snapshot_record(terminal_record)
+        snapshot["active"] = False
+        return snapshot
+    if current_record is None:
+        return {
+            "delegation_id": delegation_id,
+            "status": "not_found",
+            "active": False,
+        }
+    if callback_error is not None:
+        logger.debug(
+            "interrupt_async_delegation(%s) failed: %s",
+            delegation_id,
+            callback_error,
+        )
         return {
             "delegation_id": delegation_id,
             "status": "error",
             "active": True,
-            "error": str(exc),
+            "error": (
+                "Cancellation callback failed "
+                f"({type(callback_error).__name__})."
+            ),
         }
 
     logger.info(

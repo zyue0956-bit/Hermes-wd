@@ -2346,6 +2346,16 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    _workspace_mode = _resolve_workspace_mode(
+        task_list, default_toolsets=toolsets
+    )
+    _workspace_path = _resolve_workspace_hint(parent_agent)
+    if background and _workspace_mode == "write" and not _workspace_path:
+        return tool_error(
+            "Write delegation requires an authoritative workspace; dispatch was "
+            "rejected because the task/session cwd could not be resolved."
+        )
+
     overall_start = time.monotonic()
     results = []
 
@@ -2403,7 +2413,6 @@ def delegate_task(
     # Child file/terminal tools use the stable subagent id as their task id.
     # Register the parent's authoritative workspace under every child id so the
     # path protected by the async lock is exactly the path children resolve.
-    _workspace_path = _resolve_workspace_hint(parent_agent)
     try:
         for _, _, child in children:
             _register_child_workspace_override(child, _workspace_path)
@@ -2690,9 +2699,6 @@ def delegate_task(
 
         _session_key = caller_session_key
         _child_agents = [c for (_, _, c) in children]
-        _workspace_mode = _resolve_workspace_mode(
-            task_list, default_toolsets=toolsets
-        )
         _activity_fn = _build_delegation_activity_fn(_child_agents)
 
         # Detach every child from the parent's interrupt-propagation list — the
@@ -2777,7 +2783,9 @@ def delegate_task(
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        if dispatch.get("reason_code") == "workspace_locked":
+        if dispatch.get("reason_code") in {
+            "workspace_locked", "workspace_unavailable"
+        }:
             # The async unit never took ownership of these pre-built children.
             _teardown_rejected_children(
                 _child_agents,
