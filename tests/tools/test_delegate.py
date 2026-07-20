@@ -3048,6 +3048,8 @@ class TestDelegationLifecycleIntegration:
             "api_mode": None, "command": None, "args": None,
         }
         with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="session:test"), \
              patch.object(dt, "_resolve_workspace_hint", return_value=None), \
              patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
              patch.object(dt, "_build_child_agent") as build_child:
@@ -3130,6 +3132,8 @@ class TestDelegationLifecycleIntegration:
             return {"status": "dispatched", "delegation_id": "deleg_test"}
 
         with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="session:test"), \
              patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
              patch.object(dt, "_build_child_agent", return_value=fake_child), \
              patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
@@ -3344,6 +3348,8 @@ class TestDelegationLifecycleIntegration:
         try:
             with (
                 patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}),
+                patch("gateway.session_context.async_delivery_supported", return_value=True),
+                patch("tools.approval.get_current_session_key", return_value="session:test"),
                 patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)),
                 patch.object(dt, "_build_child_agent", return_value=fake_child),
                 patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
@@ -3387,6 +3393,8 @@ class TestDelegationLifecycleIntegration:
                      "HERMES_SESSION_KEY": "session:test",
                  },
              ), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="session:test"), \
              patch.object(dt, "_build_child_agent", return_value=fake_child), \
              patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
              patch.object(dt, "_run_single_child") as run_child, \
