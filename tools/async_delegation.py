@@ -274,8 +274,6 @@ def _admit_record(
 
 def _complete_record_locked(record: Dict[str, Any], status: str) -> str:
     """Apply shared terminal-state transitions while _records_lock is held."""
-    if record.get("cancel_requested"):
-        status = "interrupted"
     record["status"] = status
     record["completed_at"] = time.time()
     record["interrupt_fn"] = None

@@ -749,30 +749,23 @@ def _build_child_system_prompt(
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Best-effort local workspace hint for child prompts.
+    """Resolve the same task-aware workspace root used by file tools."""
+    try:
+        from tools.approval import get_current_session_key
+        from tools.file_tools import _resolve_base_dir
 
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
-    """
-    candidates = [
-        os.getenv("TERMINAL_CWD"),
-        getattr(
-            getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
-        ),
-        getattr(parent_agent, "terminal_cwd", None),
-        getattr(parent_agent, "cwd", None),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            text = os.path.abspath(os.path.expanduser(str(candidate)))
-        except Exception:
-            continue
-        if os.path.isabs(text) and os.path.isdir(text):
-            return text
-    return None
+        raw_task_id = getattr(parent_agent, "_current_task_id", None)
+        task_id = (
+            raw_task_id
+            if isinstance(raw_task_id, str) and raw_task_id
+            else get_current_session_key(default="") or "default"
+        )
+        workspace = _resolve_base_dir(task_id)
+    except Exception:
+        logger.warning("Failed to resolve authoritative delegation workspace", exc_info=True)
+        return None
+
+    return str(workspace) if workspace.is_dir() else None
 
 
 _READ_ONLY_WORKSPACE_TOOLSETS = frozenset({
@@ -2681,14 +2674,28 @@ def delegate_task(
             return _execute_and_aggregate()
 
         def _batch_interrupt():
+            failures: List[str] = []
+            interrupted = 0
             for _c in _child_agents:
                 try:
-                    if hasattr(_c, "interrupt"):
-                        _c.interrupt("Async delegation cancelled")
+                    interrupt = getattr(_c, "interrupt", None)
+                    if callable(interrupt):
+                        interrupt("Async delegation cancelled")
                     elif hasattr(_c, "_interrupt_requested"):
                         _c._interrupt_requested = True
-                except Exception:
-                    pass
+                    else:
+                        raise RuntimeError("interrupt unavailable")
+                    interrupted += 1
+                except Exception as exc:
+                    failures.append(type(exc).__name__)
+            if failures:
+                kinds = ", ".join(sorted(set(failures)))
+                raise RuntimeError(
+                    f"Failed to interrupt {len(failures)}/{len(_child_agents)} "
+                    f"subagents ({kinds})"
+                )
+            if interrupted == 0:
+                raise RuntimeError("No active subagent accepted cancellation")
 
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(

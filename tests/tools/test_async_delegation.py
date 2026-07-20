@@ -243,6 +243,56 @@ def test_interrupt_by_id_only_signals_target_and_is_idempotent():
     gates[1].set()
 
 
+def test_cancel_callback_failure_rolls_back_request_and_preserves_truth():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def interrupt_fn():
+        raise RuntimeError("cannot stop")
+
+    handle = ad.dispatch_async_delegation(
+        goal="uncancellable", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, interrupt_fn=interrupt_fn,
+    )["delegation_id"]
+
+    result = ad.interrupt_async_delegation(handle)
+    assert result["status"] == "error"
+    snapshot = ad.get_async_delegation(handle)
+    assert snapshot is not None
+    assert snapshot["status"] == "running"
+    assert snapshot["cancel_requested"] is False
+
+    gate.set()
+    event = _drain_one()
+    assert event is not None
+    assert event["status"] == "completed"
+
+
+def test_cancel_request_does_not_force_false_interrupted_status():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    handle = ad.dispatch_async_delegation(
+        goal="ignores cancel", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner,
+        interrupt_fn=gate.set,
+    )["delegation_id"]
+
+    assert ad.interrupt_async_delegation(handle)["status"] == "cancelling"
+    event = _drain_one()
+    assert event is not None
+    assert event["status"] == "completed"
+    snapshot = ad.get_async_delegation(handle)
+    assert snapshot is not None
+    assert snapshot["status"] == "completed"
+
+
 def test_interrupt_by_id_reports_unknown_and_completed():
     assert ad.interrupt_async_delegation("deleg_missing")["status"] == "not_found"
 

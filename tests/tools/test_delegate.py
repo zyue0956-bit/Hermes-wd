@@ -2798,6 +2798,94 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
 
 class TestDelegationLifecycleIntegration:
+    def test_workspace_hint_reuses_authoritative_task_cwd(self, tmp_path):
+        import tools.delegate_tool as dt
+        from tools.terminal_tool import (
+            clear_task_env_overrides,
+            register_task_env_overrides,
+        )
+
+        parent = _make_mock_parent()
+        parent._current_task_id = "session:a"
+        registered = tmp_path / "registered"
+        live = tmp_path / "live"
+        registered.mkdir()
+        live.mkdir()
+        register_task_env_overrides("session:a", {"cwd": str(registered)})
+        try:
+            with patch.dict(os.environ, {"TERMINAL_CWD": "."}), patch(
+                "tools.file_tools._get_live_tracking_cwd", return_value=str(live)
+            ):
+                assert dt._resolve_workspace_hint(parent) == str(live.resolve())
+        finally:
+            clear_task_env_overrides("session:a")
+
+    def test_workspace_hint_uses_current_session_when_task_id_missing(self, tmp_path):
+        import tools.delegate_tool as dt
+        from tools.approval import reset_current_session_key, set_current_session_key
+        from tools.terminal_tool import (
+            clear_task_env_overrides,
+            register_task_env_overrides,
+        )
+
+        parent = _make_mock_parent()
+        parent._current_task_id = None
+        registered = tmp_path / "registered"
+        registered.mkdir()
+        register_task_env_overrides("session:b", {"cwd": str(registered)})
+        token = set_current_session_key("session:b")
+        try:
+            with patch.dict(os.environ, {"TERMINAL_CWD": "."}):
+                assert dt._resolve_workspace_hint(parent) == str(registered.resolve())
+        finally:
+            reset_current_session_key(token)
+            clear_task_env_overrides("session:b")
+
+    def test_task_aware_workspace_resolution_drives_real_lock(self, tmp_path):
+        from tools import async_delegation as ad
+        import tools.delegate_tool as dt
+        from tools.terminal_tool import (
+            clear_task_env_overrides,
+            register_task_env_overrides,
+        )
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        gate = threading.Event()
+        parents = [_make_mock_parent(), _make_mock_parent()]
+        parents[0]._current_task_id = "session:a"
+        parents[1]._current_task_id = "session:b"
+        for task_id in ("session:a", "session:b"):
+            register_task_env_overrides(task_id, {"cwd": str(shared)})
+
+        def runner():
+            gate.wait(timeout=5)
+            return {"status": "completed"}
+
+        try:
+            with patch.dict(os.environ, {"TERMINAL_CWD": "."}):
+                paths = [dt._resolve_workspace_hint(parent) for parent in parents]
+            assert paths == [str(shared.resolve()), str(shared.resolve())]
+            first = ad.dispatch_async_delegation(
+                goal="first", context=None, toolsets=["file"], role="leaf",
+                model="m", session_key="session:a", runner=runner,
+                workspace_path=paths[0], workspace_mode="write",
+                max_async_children=3,
+            )
+            second = ad.dispatch_async_delegation(
+                goal="second", context=None, toolsets=["file"], role="leaf",
+                model="m", session_key="session:b", runner=runner,
+                workspace_path=paths[1], workspace_mode="write",
+                max_async_children=3,
+            )
+            assert first["status"] == "dispatched"
+            assert second["reason_code"] == "workspace_locked"
+        finally:
+            gate.set()
+            clear_task_env_overrides("session:a")
+            clear_task_env_overrides("session:b")
+            ad._reset_for_tests()
+
     def test_workspace_mode_is_read_only_for_explicit_read_toolsets(self):
         from tools.delegate_tool import _resolve_workspace_mode
 
@@ -2846,6 +2934,7 @@ class TestDelegationLifecycleIntegration:
         assert snapshot["api_call_count"] == 6
 
     def test_background_dispatch_passes_workspace_mode_and_activity(self, tmp_path):
+        import pytest
         import tools.delegate_tool as dt
 
         parent = _make_mock_parent()
@@ -2879,6 +2968,10 @@ class TestDelegationLifecycleIntegration:
         assert captured["workspace_path"] == str(tmp_path)
         assert captured["workspace_mode"] == "read"
         assert captured["activity_fn"]()["last_activity_ts"] == 123.0
+
+        fake_child.interrupt.side_effect = RuntimeError("cannot stop")
+        with pytest.raises(RuntimeError, match="Failed to interrupt 1/1"):
+            captured["interrupt_fn"]()
 
     def test_workspace_lock_rejection_does_not_fallback_to_sync(self, tmp_path):
         import tools.delegate_tool as dt
