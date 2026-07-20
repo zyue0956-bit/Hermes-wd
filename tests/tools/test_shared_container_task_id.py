@@ -147,12 +147,21 @@ def test_delegation_scoped_cwd_shares_container_without_mutating_default_env(tmp
             default_cwd=str(workspace),
             scoped_cwd=str(workspace),
         ) == str(workspace)
+        nested = workspace / "nested"
+        nested.mkdir()
         assert terminal_tool._resolve_command_cwd(
-            workdir="/explicit",
+            workdir=str(nested),
             env=default_env,
             default_cwd=str(workspace),
             scoped_cwd=str(workspace),
-        ) == "/explicit"
+        ) == str(nested.resolve())
+        with pytest.raises(ValueError, match="delegation workspace"):
+            terminal_tool._resolve_command_cwd(
+                workdir="/explicit",
+                env=default_env,
+                default_cwd=str(workspace),
+                scoped_cwd=str(workspace),
+            )
     finally:
         terminal_tool.clear_task_env_overrides("sa-scoped")
         terminal_tool._active_environments.pop("default", None)

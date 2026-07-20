@@ -949,6 +949,35 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+_BLOCKED_CHILD_TOOL_NAMES = frozenset({"skill_manage"})
+
+
+def _remove_blocked_child_tools(child: Any) -> None:
+    """Remove profile-global persistent write tools from delegated agents."""
+    valid = getattr(child, "valid_tool_names", None)
+    if isinstance(valid, set):
+        valid.difference_update(_BLOCKED_CHILD_TOOL_NAMES)
+    elif isinstance(valid, list):
+        child.valid_tool_names = [
+            name for name in valid if name not in _BLOCKED_CHILD_TOOL_NAMES
+        ]
+
+    schemas = getattr(child, "tools", None)
+    if isinstance(schemas, list):
+        def _schema_name(schema: Any) -> Optional[str]:
+            if not isinstance(schema, dict):
+                return None
+            function = schema.get("function")
+            if isinstance(function, dict):
+                return function.get("name")
+            return schema.get("name")
+
+        child.tools = [
+            schema for schema in schemas
+            if _schema_name(schema) not in _BLOCKED_CHILD_TOOL_NAMES
+        ]
+
+
 def _build_child_progress_callback(
     task_index: int,
     goal: str,
@@ -1421,6 +1450,7 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    _remove_blocked_child_tools(child)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -3350,11 +3380,11 @@ def _build_top_level_description() -> str:
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
         "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
-        "you and the user keep working, and each subagent's full result "
-        "re-enters the conversation as its own new message when it finishes. A "
-        "batch is just N independent background subagents (N handles, each "
-        "completes on its own). Do NOT wait or poll; just continue with other "
-        "work after dispatching.\n\n"
+        "you and the user keep working. A single task's full result re-enters "
+        "the conversation when it finishes. A batch uses one background handle; "
+        "its subagents run in parallel, wait on each other, and their consolidated "
+        "results re-enter as one message after ALL finish. Do NOT wait or poll; "
+        "just continue with other work after dispatching.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -3385,10 +3415,12 @@ def _build_top_level_description() -> str:
         "status) and verify it yourself — fetch the URL, stat the file, read "
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
-        "delegate_task, clarify, memory, send_message, execute_code.\n"
+        "delegate_task, clarify, memory, send_message, execute_code, or "
+        "skill_manage.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
         "delegate_task so they can spawn their own workers, but still "
-        "cannot use clarify, memory, send_message, or execute_code. "
+        "cannot use clarify, memory, send_message, execute_code, or "
+        "skill_manage. "
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"

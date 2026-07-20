@@ -1834,12 +1834,29 @@ def _resolve_command_cwd(
     call. That broke session-local ``cd`` state: the environment tracked the
     new directory in ``env.cwd``, but foreground/background calls kept forcing
     the old cwd back through ``env.execute(..., cwd=...)``. Explicit
-    ``workdir=`` must still override everything.
+    ``workdir=`` overrides normal sessions, but delegated scoped sessions may
+    only select directories inside their authoritative workspace.
     """
+    if isinstance(scoped_cwd, str) and scoped_cwd.strip():
+        scope = os.path.realpath(os.path.abspath(os.path.expanduser(scoped_cwd)))
+        if workdir:
+            requested = os.path.expanduser(workdir)
+            if not os.path.isabs(requested):
+                requested = os.path.join(scope, requested)
+            requested = os.path.realpath(os.path.abspath(requested))
+            try:
+                inside_scope = os.path.commonpath([scope, requested]) == scope
+            except ValueError:
+                inside_scope = False
+            if not inside_scope:
+                raise ValueError(
+                    f"Terminal workdir escapes delegation workspace: {requested} "
+                    f"(workspace: {scope})"
+                )
+            return requested
+        return scope
     if workdir:
         return workdir
-    if isinstance(scoped_cwd, str) and scoped_cwd.strip():
-        return scoped_cwd
 
     live_cwd = getattr(env, "cwd", None)
     if isinstance(live_cwd, str) and live_cwd.strip():

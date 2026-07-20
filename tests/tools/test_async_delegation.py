@@ -571,6 +571,30 @@ def test_workspace_lock_rejects_conflicting_modes(tmp_path, first_mode, second_m
     gate.set()
 
 
+def test_different_workspace_writes_share_global_write_lease(tmp_path):
+    gate = threading.Event()
+    (tmp_path / "repo-a").mkdir()
+    (tmp_path / "repo-b").mkdir()
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def dispatch(goal, workspace):
+        return ad.dispatch_async_delegation(
+            goal=goal, context=None, toolsets=["file"], role="leaf", model="m",
+            session_key="", runner=runner,
+            max_async_children=3, workspace_mode="write",
+            workspace_path=str(workspace),
+        )
+
+    first = dispatch("write-a", tmp_path / "repo-a")
+    second = dispatch("write-b", tmp_path / "repo-b")
+    assert first["status"] == "dispatched"
+    assert second["status"] == "rejected"
+    assert second["reason_code"] == "workspace_locked"
+    gate.set()
+
+
 def test_workspace_lock_is_released_after_completion(tmp_path):
     (tmp_path / "repo").mkdir()
     repo = str(tmp_path / "repo")
@@ -609,10 +633,10 @@ def test_session_owner_filters_listing_status_and_cancel(tmp_path):
             gates[i].set()
 
         handles.append(ad.dispatch_async_delegation(
-            goal=f"owner-{owner}", context="private", toolsets=["file"],
+            goal=f"owner-{owner}", context="private", toolsets=["web"],
             role="leaf", model="m", session_key=owner, runner=runner,
             interrupt_fn=interrupt_fn, workspace_path=str(tmp_path / owner),
-            workspace_mode="write", max_async_children=3,
+            workspace_mode="read", max_async_children=3,
         )["delegation_id"])
 
     owned = ad.list_async_delegations(owner_session_key="session:a")

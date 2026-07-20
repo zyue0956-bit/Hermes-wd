@@ -8,7 +8,7 @@ arbitrary toolsets.
 
 from types import SimpleNamespace
 
-from tools.delegate_tool import _strip_blocked_tools
+from tools.delegate_tool import _remove_blocked_child_tools, _strip_blocked_tools
 
 
 class TestToolsetIntersection:
@@ -53,6 +53,22 @@ class TestToolsetIntersection:
         assert "clarify" not in child
         assert "memory" not in child
         assert "terminal" in child
+
+    def test_skill_manage_removed_but_read_only_skill_tools_remain(self):
+        child = SimpleNamespace(
+            valid_tool_names={"skills_list", "skill_view", "skill_manage", "web_search"},
+            tools=[
+                {"function": {"name": "skills_list"}},
+                {"function": {"name": "skill_view"}},
+                {"function": {"name": "skill_manage"}},
+                {"function": {"name": "web_search"}},
+            ],
+        )
+        _remove_blocked_child_tools(child)
+        assert "skill_manage" not in child.valid_tool_names
+        assert {item["function"]["name"] for item in child.tools} == {
+            "skills_list", "skill_view", "web_search",
+        }
 
     def test_empty_intersection_yields_empty_toolsets(self):
         """If parent has no overlap with requested, child gets nothing extra."""

@@ -127,6 +127,13 @@ def _workspace_conflict_locked(
         held_path = record.get("workspace_path")
         if not _is_active(record) or not held_path:
             continue
+        held_mode = "read" if record.get("workspace_mode") == "read" else "write"
+        # Write-capable delegations share a global lease. A terminal/file task
+        # can name an absolute path outside its nominal repository, so
+        # per-repository locks alone cannot prevent two writers from touching
+        # the same external/profile-global resource.
+        if requested_mode == "write" and held_mode == "write":
+            return record
         try:
             common_path = os.path.commonpath([workspace_path, held_path])
         except ValueError:
@@ -134,7 +141,6 @@ def _workspace_conflict_locked(
         paths_overlap = common_path in {workspace_path, held_path}
         if not paths_overlap:
             continue
-        held_mode = "read" if record.get("workspace_mode") == "read" else "write"
         if requested_mode == "write" or held_mode == "write":
             return record
     return None

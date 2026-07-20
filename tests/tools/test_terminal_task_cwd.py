@@ -3,6 +3,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -188,6 +190,25 @@ def test_registering_cwd_override_updates_live_env_cwd(monkeypatch):
     assert terminal_tool._resolve_command_cwd(
         workdir=None, env=fake_env, default_cwd="/workspace/config"
     ) == "/workspace/new"
+
+
+def test_delegation_scoped_cwd_rejects_external_workdir(tmp_path):
+    workspace = tmp_path / "workspace"
+    inside = workspace / "nested"
+    outside = tmp_path / "outside"
+    inside.mkdir(parents=True)
+    outside.mkdir()
+    fake_env = SimpleNamespace(cwd=str(workspace))
+
+    assert terminal_tool._resolve_command_cwd(
+        workdir=str(inside), env=fake_env, default_cwd=str(workspace),
+        scoped_cwd=str(workspace),
+    ) == str(inside.resolve())
+    with pytest.raises(ValueError, match="delegation workspace"):
+        terminal_tool._resolve_command_cwd(
+            workdir=str(outside), env=fake_env, default_cwd=str(workspace),
+            scoped_cwd=str(workspace),
+        )
 
 
 def test_registering_cwd_override_noop_when_no_live_env(monkeypatch):

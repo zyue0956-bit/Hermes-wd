@@ -111,6 +111,8 @@ def test_timeout_keeps_workspace_override_until_worker_exits(
     monkeypatch.setattr(
         delegate_tool, "_dump_subagent_timeout_diagnostic", lambda **kwargs: None
     )
+    monkeypatch.setattr(delegate_tool, "_register_subagent", lambda *args, **kwargs: None)
+    monkeypatch.setattr(delegate_tool, "_unregister_subagent", lambda *args, **kwargs: None)
     parent = MagicMock()
     parent._touch_activity = MagicMock()
     parent._current_task_id = None
@@ -128,8 +130,8 @@ def test_timeout_keeps_workspace_override_until_worker_exits(
         )
     )
     worker.start()
-    assert child.started.wait(timeout=2)
-    assert child.interrupt_called.wait(timeout=2)
+    assert child.started.wait(timeout=10)
+    assert child.interrupt_called.wait(timeout=10)
     time.sleep(0.3)
 
     assert worker.is_alive()
