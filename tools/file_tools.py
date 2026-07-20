@@ -211,10 +211,22 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     Returns ``None`` only when there is genuinely no reliable anchor, in which
     case callers fall back to the process cwd.
     """
+    registered = _registered_task_cwd_override(task_id)
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+
+        scoped = (
+            resolve_task_overrides(task_id).get("_delegation_workspace_scoped")
+            is True
+        )
+    except Exception:
+        scoped = False
+    if scoped and registered:
+        return registered
+
     live = _get_live_tracking_cwd(task_id)
     if live:
         return live
-    registered = _registered_task_cwd_override(task_id)
     if registered:
         return registered
     return _configured_terminal_cwd()

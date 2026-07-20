@@ -2903,6 +2903,34 @@ class TestDelegationLifecycleIntegration:
         dt._clear_child_workspace_override(child)
         assert "cwd" not in resolve_task_overrides("sa-workspace-test")
 
+    def test_concurrent_child_workspace_overrides_do_not_cross_cwd(self, tmp_path):
+        import tools.delegate_tool as dt
+        from tools import file_tools, terminal_tool
+
+        workspace_a = tmp_path / "a"
+        workspace_b = tmp_path / "b"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+        default_env = MagicMock()
+        default_env.cwd = str(tmp_path / "default")
+        child_a = MagicMock(_subagent_id="sa-a")
+        child_b = MagicMock(_subagent_id="sa-b")
+
+        with patch.dict(terminal_tool._active_environments, {"default": default_env}, clear=True), \
+             patch.dict(file_tools._file_ops_cache, {}, clear=True):
+            try:
+                dt._register_child_workspace_override(child_a, str(workspace_a))
+                dt._register_child_workspace_override(child_b, str(workspace_b))
+
+                assert terminal_tool._resolve_container_task_id("sa-a") == "default"
+                assert terminal_tool._resolve_container_task_id("sa-b") == "default"
+                assert default_env.cwd == str(tmp_path / "default")
+                assert file_tools._resolve_base_dir("sa-a") == workspace_a.resolve()
+                assert file_tools._resolve_base_dir("sa-b") == workspace_b.resolve()
+            finally:
+                dt._clear_child_workspace_override(child_a)
+                dt._clear_child_workspace_override(child_b)
+
     def test_write_delegation_rejects_missing_authoritative_workspace(self):
         import tools.delegate_tool as dt
 

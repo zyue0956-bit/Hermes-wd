@@ -977,7 +977,12 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     # command has run. Pushing it onto the live env keeps ``cd`` tracking intact
     # while letting an explicit ACP cwd change win, as the client expects.
     new_cwd = overrides.get("cwd")
-    if isinstance(new_cwd, str) and new_cwd.strip():
+    scoped_delegation_cwd = overrides.get("_delegation_workspace_scoped") is True
+    if (
+        isinstance(new_cwd, str)
+        and new_cwd.strip()
+        and not scoped_delegation_cwd
+    ):
         # The live env is cached under the raw task_id for per-session surfaces
         # (ACP/gateway/dashboard) and under the collapsed container id for
         # isolation-keyed rollouts. Try the raw id first, then the container id,
@@ -1821,6 +1826,7 @@ def _resolve_command_cwd(
     workdir: Optional[str],
     env: Any,
     default_cwd: str,
+    scoped_cwd: Optional[str] = None,
 ) -> str:
     """Return the cwd for a command, preferring the live session cwd.
 
@@ -1832,6 +1838,8 @@ def _resolve_command_cwd(
     """
     if workdir:
         return workdir
+    if isinstance(scoped_cwd, str) and scoped_cwd.strip():
+        return scoped_cwd
 
     live_cwd = getattr(env, "cwd", None)
     if isinstance(live_cwd, str) and live_cwd.strip():
@@ -1925,6 +1933,9 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
+        scoped_cwd = (
+            cwd if overrides.get("_delegation_workspace_scoped") is True else None
+        )
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -2156,6 +2167,7 @@ def terminal_tool(
                 workdir=workdir,
                 env=env,
                 default_cwd=cwd,
+                scoped_cwd=scoped_cwd,
             )
             try:
                 if env_type == "local":
@@ -2404,6 +2416,7 @@ def terminal_tool(
                             workdir=workdir,
                             env=env,
                             default_cwd=cwd,
+                            scoped_cwd=scoped_cwd,
                         ),
                     }
                     result = env.execute(command, **execute_kwargs)

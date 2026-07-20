@@ -832,7 +832,13 @@ def _register_child_workspace_override(child: Any, workspace_path: Optional[str]
         return
     from tools.terminal_tool import register_task_env_overrides
 
-    register_task_env_overrides(child_task_id, {"cwd": workspace_path})
+    register_task_env_overrides(
+        child_task_id,
+        {
+            "cwd": workspace_path,
+            "_delegation_workspace_scoped": True,
+        },
+    )
     child._delegate_workspace_task_id = child_task_id
 
 

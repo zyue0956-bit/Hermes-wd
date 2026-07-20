@@ -124,6 +124,40 @@ def test_cwd_only_override_collapses_to_default():
         terminal_tool.clear_task_env_overrides("acp-session-abc")
 
 
+def test_delegation_scoped_cwd_shares_container_without_mutating_default_env(tmp_path):
+    class FakeEnv:
+        cwd = str(tmp_path / "default")
+
+    default_env = FakeEnv()
+    terminal_tool._active_environments["default"] = default_env
+    workspace = tmp_path / "delegated"
+    workspace.mkdir()
+    terminal_tool.register_task_env_overrides(
+        "sa-scoped", {
+            "cwd": str(workspace),
+            "_delegation_workspace_scoped": True,
+        },
+    )
+    try:
+        assert terminal_tool._resolve_container_task_id("sa-scoped") == "default"
+        assert default_env.cwd == str(tmp_path / "default")
+        assert terminal_tool._resolve_command_cwd(
+            workdir=None,
+            env=default_env,
+            default_cwd=str(workspace),
+            scoped_cwd=str(workspace),
+        ) == str(workspace)
+        assert terminal_tool._resolve_command_cwd(
+            workdir="/explicit",
+            env=default_env,
+            default_cwd=str(workspace),
+            scoped_cwd=str(workspace),
+        ) == "/explicit"
+    finally:
+        terminal_tool.clear_task_env_overrides("sa-scoped")
+        terminal_tool._active_environments.pop("default", None)
+
+
 def test_cwd_plus_docker_image_keeps_own_id():
     """When overrides include both cwd AND docker_image, isolation must
     still be honoured (RL/benchmark pattern with explicit cwd)."""
