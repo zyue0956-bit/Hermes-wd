@@ -3084,10 +3084,31 @@ def delegate_task(
                 ensure_ascii=False,
             )
 
-        # Capacity/schedule rejection keeps the historical synchronous fallback.
+        if _workspace_mode == "write":
+            # A write-capable task must never fall back to unregistered sync
+            # execution: the async record owns the global write lease, and a
+            # schedule/capacity rejection means no lease covers the real worker.
+            _teardown_rejected_children(
+                _child_agents,
+                parent_agent,
+                reason=dispatch.get(
+                    "error", "Write delegation could not be scheduled safely."
+                ),
+            )
+            return json.dumps(
+                {
+                    "error": dispatch.get(
+                        "error", "Write delegation could not be scheduled safely."
+                    ),
+                    "reason_code": dispatch.get("reason_code", "schedule_failed"),
+                },
+                ensure_ascii=False,
+            )
+
+        # Read-only capacity/schedule rejection keeps the historical synchronous fallback.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
+            "read-only batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
         return json.dumps(_execute_and_aggregate(), ensure_ascii=False)

@@ -3151,6 +3151,145 @@ class TestDelegationLifecycleIntegration:
         with pytest.raises(RuntimeError, match="Failed to interrupt 1/1"):
             captured["interrupt_fn"]()
 
+    def test_write_schedule_or_capacity_rejection_never_runs_sync_fallback(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        for reason_code in ("schedule_failed", "capacity_reached"):
+            parent = _make_mock_parent()
+            child = MagicMock()
+            child._subagent_id = f"sa-{reason_code}"
+            child._delegate_role = "leaf"
+            child._delegate_workspace_task_id = None
+            rejected = {
+                "status": "rejected",
+                "reason_code": reason_code,
+                "error": f"{reason_code} injected",
+            }
+            with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+                 patch("gateway.session_context.async_delivery_supported", return_value=True), \
+                 patch("tools.approval.get_current_session_key", return_value="session:test"), \
+                 patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
+                 patch.object(dt, "_build_child_agent", return_value=child), \
+                 patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+                 patch("tools.async_delegation.dispatch_async_delegation_batch", return_value=rejected), \
+                 patch.object(dt, "_run_single_child") as run_child:
+                result = json.loads(dt.delegate_task(
+                    goal="write", toolsets=["file"], background=True,
+                    parent_agent=parent,
+                ))
+
+            assert result["reason_code"] == reason_code
+            run_child.assert_not_called()
+            child.close.assert_called_once()
+
+    def test_read_only_capacity_rejection_keeps_sync_fallback(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child._subagent_id = "sa-read-fallback"
+        child._delegate_role = "leaf"
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        completed = {
+            "task_index": 0, "status": "completed", "summary": "ok",
+            "api_calls": 0, "duration_seconds": 0.01, "model": "m",
+            "exit_reason": "completed",
+        }
+        rejected = {
+            "status": "rejected", "reason_code": "capacity_reached",
+            "error": "capacity injected",
+        }
+        with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="session:test"), \
+             patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
+             patch.object(dt, "_build_child_agent", return_value=child), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+             patch("tools.async_delegation.dispatch_async_delegation_batch", return_value=rejected), \
+             patch.object(dt, "_run_single_child", return_value=completed) as run_child:
+            result = json.loads(dt.delegate_task(
+                goal="read", toolsets=["web"], background=True,
+                parent_agent=parent,
+            ))
+
+        assert result["results"][0]["status"] == "completed"
+        run_child.assert_called_once()
+
+    def test_real_write_schedule_and_capacity_failures_never_run_sync(self, tmp_path):
+        from contextlib import ExitStack
+        from tools import async_delegation as ad
+        import tools.delegate_tool as dt
+
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        write_workspace = tmp_path / "write"
+        read_workspace = tmp_path / "read"
+        write_workspace.mkdir()
+        read_workspace.mkdir()
+
+        def invoke(extra_patches=()):
+            parent = _make_mock_parent()
+            child = MagicMock()
+            child._subagent_id = "sa-real-rejection"
+            child._delegate_role = "leaf"
+            child._delegate_workspace_task_id = None
+            patches = [
+                patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}),
+                patch("gateway.session_context.async_delivery_supported", return_value=True),
+                patch("tools.approval.get_current_session_key", return_value="session:test"),
+                patch.object(dt, "_resolve_workspace_hint", return_value=str(write_workspace)),
+                patch.object(dt, "_build_child_agent", return_value=child),
+                patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
+                patch.object(dt, "_run_single_child"),
+                *extra_patches,
+            ]
+            with ExitStack() as stack:
+                entered = [stack.enter_context(item) for item in patches]
+                result = json.loads(dt.delegate_task(
+                    goal="write", toolsets=["file"], background=True,
+                    parent_agent=parent,
+                ))
+            return result, child, entered[6]
+
+        gate = None
+        try:
+            schedule, schedule_child, schedule_run = invoke((
+                patch.object(ad, "_get_executor", side_effect=RuntimeError("init failed")),
+            ))
+            assert schedule["reason_code"] == "schedule_failed"
+            schedule_run.assert_not_called()
+            schedule_child.close.assert_called_once()
+            assert ad.active_count() == 0
+
+            gate = threading.Event()
+            holder = ad.dispatch_async_delegation(
+                goal="read holder", context=None, toolsets=["web"], role="leaf",
+                model="m", session_key="holder",
+                runner=lambda: (gate.wait(timeout=5), {"status": "completed"})[1],
+                workspace_path=str(read_workspace), workspace_mode="read",
+                max_async_children=1,
+            )
+            assert holder["status"] == "dispatched"
+            capacity, capacity_child, capacity_run = invoke((
+                patch.object(dt, "_get_max_async_children", return_value=1),
+            ))
+            assert capacity["reason_code"] == "capacity_reached"
+            capacity_run.assert_not_called()
+            capacity_child.close.assert_called_once()
+        finally:
+            if gate is not None:
+                gate.set()
+            ad._reset_for_tests()
+
     def test_sync_batch_business_submit_failure_runs_every_child_once(self, tmp_path):
         import tools.delegate_tool as dt
 
@@ -3360,7 +3499,7 @@ class TestDelegationLifecycleIntegration:
                 ),
             ):
                 result = json.loads(dt.delegate_task(
-                    goal="edit", toolsets=["file"], background=True,
+                    goal="research", toolsets=["web"], background=True,
                     parent_agent=parent,
                 ))
         finally:
