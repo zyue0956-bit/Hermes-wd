@@ -3234,6 +3234,29 @@ class TestDelegationLifecycleIntegration:
         assert invoke_hook.call_args.args[0] == "subagent_stop"
         assert invoke_hook.call_args.kwargs["child_status"] == "rejected"
 
+    def test_run_child_preflight_lease_failure_still_tears_down(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child._subagent_id = "sa-lease-fail"
+        child._delegate_saved_tool_names = []
+        child._delegate_role = "leaf"
+        child.tool_progress_callback = None
+        pool = MagicMock()
+        pool.acquire_lease.side_effect = RuntimeError("lease unavailable")
+        child._credential_pool = pool
+        parent._active_children = [child]
+        parent._active_children_lock = threading.Lock()
+
+        result = dt._run_single_child(
+            task_index=0, goal="lease failure", child=child, parent_agent=parent
+        )
+
+        assert result["status"] == "error"
+        child.close.assert_called_once_with()
+        assert child not in parent._active_children
+
     def test_run_child_teardown_continues_when_override_cleanup_fails(self):
         import tools.delegate_tool as dt
 

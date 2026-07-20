@@ -1631,7 +1631,92 @@ def _dump_subagent_timeout_diagnostic(
         return None
 
 
+def _fail_safe_preflight_teardown(child: Any, parent_agent: Any) -> None:
+    """Best-effort cleanup when child startup fails before the main finally."""
+    subagent_id = getattr(child, "_subagent_id", None)
+    if isinstance(subagent_id, str) and subagent_id:
+        try:
+            _unregister_subagent(subagent_id)
+        except Exception:
+            logger.warning("Failed to unregister preflight child", exc_info=True)
+
+    try:
+        _clear_child_workspace_override(child)
+    except Exception:
+        logger.warning("Failed to clear preflight workspace override", exc_info=True)
+
+    active_lease = getattr(child, "_delegate_active_lease", None)
+    if isinstance(active_lease, tuple) and len(active_lease) == 2:
+        pool, lease_id = active_lease
+        try:
+            pool.release_lease(lease_id)
+        except Exception:
+            logger.warning("Failed to release preflight credential lease", exc_info=True)
+        finally:
+            setattr(child, "_delegate_active_lease", None)
+
+    active_children = getattr(parent_agent, "_active_children", None)
+    if isinstance(active_children, list):
+        lock = getattr(parent_agent, "_active_children_lock", None)
+        try:
+            if lock is not None:
+                with lock:
+                    active_children.remove(child)
+            else:
+                active_children.remove(child)
+        except ValueError:
+            pass
+        except Exception:
+            logger.warning("Failed to remove preflight child ownership", exc_info=True)
+
+    try:
+        import model_tools
+
+        saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
+        if isinstance(saved_tool_names, list):
+            model_tools._last_resolved_tool_names = list(saved_tool_names)
+    except Exception:
+        logger.warning("Failed to restore tools after preflight failure", exc_info=True)
+
+    try:
+        close = getattr(child, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        logger.warning("Failed to close child after preflight failure", exc_info=True)
+
+
 def _run_single_child(
+    task_index: int,
+    goal: str,
+    child=None,
+    parent_agent=None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """Fail-safe wrapper covering exceptions before the inner main try/finally."""
+    try:
+        return _run_single_child_impl(
+            task_index=task_index,
+            goal=goal,
+            child=child,
+            parent_agent=parent_agent,
+            **kwargs,
+        )
+    except Exception as exc:
+        logger.exception("Subagent preflight failed before lifecycle activation")
+        _fail_safe_preflight_teardown(child, parent_agent)
+        return {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "api_calls": 0,
+            "duration_seconds": 0,
+            "_child_role": getattr(child, "_delegate_role", None),
+        }
+
+
+def _run_single_child_impl(
     task_index: int,
     goal: str,
     child=None,
@@ -1660,6 +1745,7 @@ def _run_single_child(
     if child_pool is not None:
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
+            setattr(child, "_delegate_active_lease", (child_pool, leased_cred_id))
             try:
                 leased_entry = child_pool.current()
                 if leased_entry is not None and hasattr(child, "_swap_credential"):
@@ -2203,6 +2289,8 @@ def _run_single_child(
                 child_pool.release_lease(leased_cred_id)
             except Exception as exc:
                 logger.debug("Failed to release credential lease: %s", exc)
+            finally:
+                setattr(child, "_delegate_active_lease", None)
 
         try:
             import model_tools
