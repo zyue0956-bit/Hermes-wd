@@ -28,7 +28,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from toolsets import TOOLSETS
 
@@ -763,6 +763,63 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         if os.path.isabs(text) and os.path.isdir(text):
             return text
     return None
+
+
+_READ_ONLY_WORKSPACE_TOOLSETS = frozenset({
+    "web", "search", "x_search", "browser", "vision", "video", "skills",
+    "session_search", "maps",
+})
+
+
+def _resolve_workspace_mode(
+    task_list: List[Dict[str, Any]],
+    default_toolsets: Optional[List[str]] = None,
+) -> str:
+    """Conservatively classify a delegation as read-only or workspace-writing.
+
+    Inherited/unknown toolsets are treated as write-capable. This intentionally
+    biases toward preventing concurrent repository corruption rather than
+    maximising fan-out.
+    """
+    for task in task_list:
+        task_toolsets = task.get("toolsets") or default_toolsets
+        if not task_toolsets:
+            return "write"
+        if any(name not in _READ_ONLY_WORKSPACE_TOOLSETS for name in task_toolsets):
+            return "write"
+    return "read"
+
+
+def _build_delegation_activity_fn(children: List[Any]) -> Callable[[], Dict[str, Any]]:
+    """Aggregate child-native activity summaries for the async registry."""
+    def _activity() -> Dict[str, Any]:
+        summaries: List[Dict[str, Any]] = []
+        total_api_calls = 0
+        for child in children:
+            try:
+                summary = child.get_activity_summary() or {}
+            except Exception:
+                continue
+            if not isinstance(summary, dict):
+                continue
+            summaries.append(summary)
+            calls = summary.get("api_call_count", 0)
+            if isinstance(calls, (int, float)):
+                total_api_calls += int(calls)
+        if not summaries:
+            return {}
+        latest = max(
+            summaries,
+            key=lambda item: float(item.get("last_activity_ts") or 0.0),
+        )
+        return {
+            "last_activity_ts": latest.get("last_activity_ts"),
+            "last_activity_desc": latest.get("last_activity_desc"),
+            "current_tool": latest.get("current_tool"),
+            "api_call_count": total_api_calls,
+        }
+
+    return _activity
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -2529,6 +2586,11 @@ def delegate_task(
 
         _session_key = get_current_session_key(default="")
         _child_agents = [c for (_, _, c) in children]
+        _workspace_path = _resolve_workspace_hint(parent_agent)
+        _workspace_mode = _resolve_workspace_mode(
+            task_list, default_toolsets=toolsets
+        )
+        _activity_fn = _build_delegation_activity_fn(_child_agents)
 
         # Detach every child from the parent's interrupt-propagation list — the
         # batch's lifecycle is owned by the async registry now, not the parent
@@ -2568,6 +2630,9 @@ def delegate_task(
             session_key=_session_key,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            activity_fn=_activity_fn,
+            workspace_path=_workspace_path,
+            workspace_mode=_workspace_mode,
             max_async_children=_get_max_async_children(),
         )
 
@@ -2595,9 +2660,26 @@ def delegate_task(
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        if dispatch.get("reason_code") == "workspace_locked":
+            # The async unit never took ownership of these pre-built children.
+            # Close them explicitly; unlike capacity fallback, they will not run.
+            for child in _child_agents:
+                try:
+                    if hasattr(child, "close"):
+                        child.close()
+                except Exception:
+                    logger.debug("Failed to close child after workspace rejection")
+            return json.dumps(
+                {
+                    "error": dispatch.get("error", "Workspace is locked."),
+                    "reason_code": "workspace_locked",
+                    "holder_delegation_id": dispatch.get("holder_delegation_id"),
+                    "workspace_path": dispatch.get("workspace_path"),
+                },
+                ensure_ascii=False,
+            )
+
+        # Capacity/schedule rejection keeps the historical synchronous fallback.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",

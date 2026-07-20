@@ -2795,5 +2795,121 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+
+
+class TestDelegationLifecycleIntegration:
+    def test_workspace_mode_is_read_only_for_explicit_read_toolsets(self):
+        from tools.delegate_tool import _resolve_workspace_mode
+
+        assert _resolve_workspace_mode([{"goal": "a", "toolsets": ["web"]}]) == "read"
+        assert _resolve_workspace_mode(
+            [{"goal": "a", "toolsets": ["browser", "search"]}]
+        ) == "read"
+
+    def test_workspace_mode_is_conservative_for_write_or_inherited_tools(self):
+        from tools.delegate_tool import _resolve_workspace_mode
+
+        assert _resolve_workspace_mode([{"goal": "a"}]) == "write"
+        for toolset in ("terminal", "file", "computer_use", "coding"):
+            assert _resolve_workspace_mode(
+                [{"goal": "a", "toolsets": [toolset]}]
+            ) == "write"
+        assert _resolve_workspace_mode(
+            [
+                {"goal": "read", "toolsets": ["web"]},
+                {"goal": "write", "toolsets": ["file"]},
+            ]
+        ) == "write"
+
+    def test_activity_fn_uses_latest_child_activity(self):
+        from tools.delegate_tool import _build_delegation_activity_fn
+
+        older = MagicMock()
+        older.get_activity_summary.return_value = {
+            "last_activity_ts": 100.0,
+            "last_activity_desc": "older",
+            "current_tool": None,
+            "api_call_count": 2,
+        }
+        newer = MagicMock()
+        newer.get_activity_summary.return_value = {
+            "last_activity_ts": 200.0,
+            "last_activity_desc": "newer",
+            "current_tool": "terminal",
+            "api_call_count": 4,
+        }
+
+        snapshot = _build_delegation_activity_fn([older, newer])()
+        assert snapshot["last_activity_ts"] == 200.0
+        assert snapshot["last_activity_desc"] == "newer"
+        assert snapshot["current_tool"] == "terminal"
+        assert snapshot["api_call_count"] == 6
+
+    def test_background_dispatch_passes_workspace_mode_and_activity(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        fake_child.get_activity_summary.return_value = {
+            "last_activity_ts": 123.0,
+            "last_activity_desc": "working",
+            "current_tool": None,
+            "api_call_count": 1,
+        }
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        captured = {}
+
+        def fake_dispatch(**kwargs):
+            captured.update(kwargs)
+            return {"status": "dispatched", "delegation_id": "deleg_test"}
+
+        with patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
+             patch.object(dt, "_build_child_agent", return_value=fake_child), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+             patch("tools.async_delegation.dispatch_async_delegation_batch", side_effect=fake_dispatch):
+            result = json.loads(dt.delegate_task(
+                goal="research", toolsets=["web"], background=True, parent_agent=parent
+            ))
+
+        assert result["status"] == "dispatched"
+        assert captured["workspace_path"] == str(tmp_path)
+        assert captured["workspace_mode"] == "read"
+        assert captured["activity_fn"]()["last_activity_ts"] == 123.0
+
+    def test_workspace_lock_rejection_does_not_fallback_to_sync(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        rejected = {
+            "status": "rejected",
+            "reason_code": "workspace_locked",
+            "holder_delegation_id": "deleg_holder",
+            "error": "workspace locked",
+        }
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": str(tmp_path)}), \
+             patch.object(dt, "_build_child_agent", return_value=fake_child), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+             patch.object(dt, "_run_single_child") as run_child, \
+             patch("tools.async_delegation.dispatch_async_delegation_batch", return_value=rejected):
+            result = json.loads(dt.delegate_task(
+                goal="edit code", toolsets=["file"], background=True, parent_agent=parent
+            ))
+
+        assert "workspace locked" in result["error"]
+        assert result["holder_delegation_id"] == "deleg_holder"
+        run_child.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
