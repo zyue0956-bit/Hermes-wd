@@ -770,6 +770,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     }
     # monkeypatch (not `with`) so patches outlive delegate_task's return and
     # remain active while the background worker runs.
+    monkeypatch.setenv("HERMES_SESSION_KEY", "session:test")
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
@@ -839,6 +840,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch, tmp_path):
     # background worker thread runs _execute_and_aggregate AFTER delegate_task
     # has already returned.
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_KEY", "session:test")
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", _blocking_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
@@ -968,7 +970,8 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch, tmp_pa
         "api_mode": None, "command": None, "args": None,
     }
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-    with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
+    monkeypatch.setenv("HERMES_SESSION_KEY", "session:test")
+    with patch.object(dt, "_build_child_agent", side_effect=build_and_register),\
          patch.object(dt, "_run_single_child", side_effect=slow_child), \
          patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
         out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)

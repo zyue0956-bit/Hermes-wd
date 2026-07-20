@@ -907,6 +907,22 @@ def _teardown_rejected_children(
                 "Failed to clear rejected child workspace override",
                 exc_info=True,
             )
+        active_children = getattr(parent_agent, "_active_children", None)
+        if isinstance(active_children, list):
+            active_lock = getattr(parent_agent, "_active_children_lock", None)
+            try:
+                if active_lock is not None:
+                    with active_lock:
+                        active_children.remove(child)
+                else:
+                    active_children.remove(child)
+            except ValueError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Failed to remove rejected child from parent lifecycle",
+                    exc_info=True,
+                )
         close = getattr(child, "close", None)
         if not callable(close):
             logger.warning(
@@ -2273,6 +2289,28 @@ def delegate_task(
     except Exception:
         caller_session_key = ""
 
+    _async_ok = False
+    if background:
+        try:
+            from gateway.session_context import async_delivery_supported
+
+            _async_ok = bool(async_delivery_supported())
+        except Exception:
+            # A detached result without a verified delivery route is unsafe;
+            # degrade to the synchronous path instead of guessing.
+            _async_ok = False
+        if _async_ok and not caller_session_key:
+            return json.dumps(
+                {
+                    "error": (
+                        "Background delegation requires a non-empty owning "
+                        "session key; dispatch was rejected."
+                    ),
+                    "reason_code": "session_owner_unavailable",
+                },
+                ensure_ascii=False,
+            )
+
     # The operator gate is global; LLM delegation_control pauses only its own
     # session so one chat cannot block every other gateway tenant.
     if is_spawn_paused(caller_session_key):
@@ -2431,6 +2469,13 @@ def delegate_task(
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+    except Exception:
+        _teardown_rejected_children(
+            [child for _, _, child in children],
+            parent_agent,
+            reason="Child construction failed.",
+        )
+        raise
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
@@ -2702,11 +2747,6 @@ def delegate_task(
         # work still runs and its result returns in this same response, which is
         # strictly better than a handle that never resolves. Mirrors the
         # pool-at-capacity inline fallback below.
-        try:
-            from gateway.session_context import async_delivery_supported
-            _async_ok = async_delivery_supported()
-        except Exception:
-            _async_ok = True
         if not _async_ok:
             logger.info(
                 "delegate_task: async delivery unsupported on this session "

@@ -2954,7 +2954,8 @@ class TestDelegationLifecycleIntegration:
             "model": "m", "provider": None, "base_url": None, "api_key": None,
             "api_mode": None, "command": None, "args": None,
         }
-        with patch.object(dt, "_resolve_workspace_hint", return_value=None), \
+        with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+             patch.object(dt, "_resolve_workspace_hint", return_value=None), \
              patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
              patch.object(dt, "_build_child_agent") as build_child:
             result = json.loads(dt.delegate_task(
@@ -3035,7 +3036,8 @@ class TestDelegationLifecycleIntegration:
             captured.update(kwargs)
             return {"status": "dispatched", "delegation_id": "deleg_test"}
 
-        with patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
+        with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+             patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
              patch.object(dt, "_build_child_agent", return_value=fake_child), \
              patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
              patch("tools.async_delegation.dispatch_async_delegation_batch", side_effect=fake_dispatch):
@@ -3051,6 +3053,59 @@ class TestDelegationLifecycleIntegration:
         fake_child.interrupt.side_effect = RuntimeError("cannot stop")
         with pytest.raises(RuntimeError, match="Failed to interrupt 1/1"):
             captured["interrupt_fn"]()
+
+    def test_background_dispatch_rejects_missing_session_owner(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        with patch(
+            "tools.approval.get_current_session_key",
+            side_effect=RuntimeError("context unavailable"),
+        ), patch(
+            "gateway.session_context.async_delivery_supported", return_value=True
+        ), patch.object(dt, "_build_child_agent") as build_child:
+            result = json.loads(dt.delegate_task(
+                goal="edit", toolsets=["file"], background=True,
+                parent_agent=parent,
+            ))
+
+        assert result["reason_code"] == "session_owner_unavailable"
+        build_child.assert_not_called()
+
+    def test_child_build_failure_tears_down_previously_built_children(self, tmp_path):
+        import pytest
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        first = MagicMock()
+        first._subagent_id = "sa-first"
+        first._delegate_role = "leaf"
+        parent._active_children = []
+        parent._active_children_lock = threading.Lock()
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+
+        def build(**kwargs):
+            if not parent._active_children:
+                parent._active_children.append(first)
+                return first
+            raise RuntimeError("second build failed")
+
+        with (
+            patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)),
+            patch.object(dt, "_build_child_agent", side_effect=build),
+            patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
+            pytest.raises(RuntimeError, match="second build failed"),
+        ):
+            dt.delegate_task(
+                tasks=[{"goal": "one"}, {"goal": "two"}],
+                background=False, parent_agent=parent,
+            )
+
+        first.close.assert_called_once_with()
+        assert first not in parent._active_children
 
     def test_capacity_fallback_restores_parent_interrupt_ownership(self, tmp_path):
         import tools.delegate_tool as dt
@@ -3077,6 +3132,7 @@ class TestDelegationLifecycleIntegration:
 
         try:
             with (
+                patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}),
                 patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)),
                 patch.object(dt, "_build_child_agent", return_value=fake_child),
                 patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
@@ -3113,7 +3169,13 @@ class TestDelegationLifecycleIntegration:
             "error": "workspace unavailable",
         }
 
-        with patch.dict(os.environ, {"TERMINAL_CWD": str(tmp_path)}), \
+        with patch.dict(
+                 os.environ,
+                 {
+                     "TERMINAL_CWD": str(tmp_path),
+                     "HERMES_SESSION_KEY": "session:test",
+                 },
+             ), \
              patch.object(dt, "_build_child_agent", return_value=fake_child), \
              patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
              patch.object(dt, "_run_single_child") as run_child, \
@@ -3153,6 +3215,8 @@ class TestDelegationLifecycleIntegration:
         parent.session_id = "parent-session"
         parent._current_turn_id = "turn-1"
         child = MagicMock()
+        parent._active_children = [child]
+        parent._active_children_lock = threading.Lock()
         child.session_id = "child-session"
         child._delegate_role = "leaf"
         child.tool_progress_callback = MagicMock()
@@ -3165,6 +3229,7 @@ class TestDelegationLifecycleIntegration:
         child.tool_progress_callback.assert_called_once()
         assert child.tool_progress_callback.call_args.args[0] == "subagent.complete"
         child.close.assert_called_once_with()
+        assert child not in parent._active_children
         invoke_hook.assert_called_once()
         assert invoke_hook.call_args.args[0] == "subagent_stop"
         assert invoke_hook.call_args.kwargs["child_status"] == "rejected"
