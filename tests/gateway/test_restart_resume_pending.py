@@ -1345,12 +1345,12 @@ async def test_restart_banner_uses_try_to_resume_wording():
 
     assert len(adapter.sent) == 1
     msg = adapter.sent[0]
-    assert "restarting" in msg
-    assert "try to resume" in msg
+    assert "正在重启" in msg
+    assert "尝试从中断处继续" in msg
 
 
 @pytest.mark.asyncio
-async def test_restart_notifies_home_channel_even_without_active_sessions():
+async def test_restart_does_not_notify_home_channel_without_active_sessions():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
@@ -1361,10 +1361,7 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
-    ]
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
@@ -1384,7 +1381,7 @@ async def test_restart_home_channel_notification_dedupes_active_chat():
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_not_deduped_across_threads():
+async def test_restart_notifies_only_active_thread_when_home_channel_shares_chat():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:group:999"
@@ -1406,13 +1403,12 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 2
+    assert len(adapter.sent) == 1
     assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
-    assert adapter.sent_calls[1][2] is None
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_ignores_false_send_result():
+async def test_restart_home_channel_notification_is_suppressed():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
@@ -1424,7 +1420,7 @@ async def test_restart_home_channel_notification_ignores_false_send_result():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    adapter.send.assert_called_once()
+    adapter.send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

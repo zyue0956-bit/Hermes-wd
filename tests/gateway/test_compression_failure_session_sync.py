@@ -56,6 +56,7 @@ class _CompressionThenFailureAgent:
 
 class _StreamConsumer:
     final_response_sent = False
+    message_id = None
 
     def __init__(self, *_args, **_kwargs):
         pass

@@ -14771,6 +14771,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
+        # The callback closes over this before streaming setup runs below.
+        # Initialize it now so Feishu tool progress can safely fire even when
+        # streaming is disabled or no consumer is created.
+        _stream_consumer = None
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
@@ -15436,7 +15440,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # read *and* reassign the outer `_run_agent` parameter without
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
+            nonlocal message, _stream_consumer
 
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
@@ -15565,9 +15569,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             initial_reply_to_id=event_message_id,
                         )
                         if _want_stream_deltas:
+                            _delta_consumer = _stream_consumer
+
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
-                                    _stream_consumer.on_delta(text)
+                                    _delta_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)

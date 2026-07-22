@@ -1,4 +1,4 @@
-"""Tests that /new (and its /reset alias) clears session-scoped overrides."""
+"""Tests that /new resets transient state but preserves persistent model choice."""
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -67,8 +67,8 @@ def _make_runner():
 
 
 @pytest.mark.asyncio
-async def test_new_command_clears_session_model_override():
-    """/new must remove the session-scoped model override for that session."""
+async def test_new_command_preserves_model_but_clears_transient_overrides():
+    """/new keeps the persistent model while clearing reasoning and pending notes."""
     runner = _make_runner()
     session_key = build_session_key(_make_source())
 
@@ -85,7 +85,7 @@ async def test_new_command_clears_session_model_override():
 
     await runner._handle_reset_command(_make_event("/new"))
 
-    assert session_key not in runner._session_model_overrides
+    assert runner._session_model_overrides[session_key]["model"] == "gpt-4o"
     assert session_key not in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
 
@@ -106,8 +106,8 @@ async def test_new_command_no_override_is_noop():
 
 
 @pytest.mark.asyncio
-async def test_new_command_only_clears_own_session():
-    """/new must only clear the override for the session that triggered it."""
+async def test_new_command_only_clears_own_transient_state():
+    """/new keeps all model choices and clears only the caller's transient state."""
     runner = _make_runner()
     session_key = build_session_key(_make_source())
     other_key = "other_session_key"
@@ -133,8 +133,8 @@ async def test_new_command_only_clears_own_session():
 
     await runner._handle_reset_command(_make_event("/new"))
 
-    assert session_key not in runner._session_model_overrides
-    assert other_key in runner._session_model_overrides
+    assert runner._session_model_overrides[session_key]["model"] == "gpt-4o"
+    assert runner._session_model_overrides[other_key]["model"] == "claude-sonnet-4-6"
     assert session_key not in runner._session_reasoning_overrides
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes

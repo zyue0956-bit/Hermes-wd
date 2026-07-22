@@ -467,6 +467,57 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(monkeypa
     assert adapter.edits[0]["message_id"] == "progress-1"
 
 
+@pytest.mark.asyncio
+async def test_run_agent_feishu_card_progress_uses_created_stream_consumer(monkeypatch, tmp_path):
+    """Feishu card tool progress must reach the consumer created inside run_sync."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.FEISHU)
+    adapter._card_mode_enabled = True
+    runner = _make_runner(adapter)
+    runner.config.streaming = StreamingConfig(enabled=True, transport="edit")
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    statuses = []
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    monkeypatch.setattr(
+        GatewayStreamConsumer,
+        "on_tool_status",
+        lambda self, status: statuses.append(status),
+    )
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+    )
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-feishu-card-progress",
+        session_key="agent:main:feishu:group:oc_chat",
+    )
+
+    assert result["final_response"] == "done"
+    assert len(statuses) == 2
+    assert all(status.startswith("⏳ *") for status in statuses)
+    assert adapter.sent == []
+
+
 # ---------------------------------------------------------------------------
 # Preview truncation tests (all/new mode respects tool_preview_length)
 # ---------------------------------------------------------------------------

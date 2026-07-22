@@ -16,7 +16,7 @@ import pytest
 
 def _make_adapter():
     """Build a minimal FeishuAdapter with mocked SDK dependencies."""
-    from gateway.platforms.feishu import FeishuAdapter
+    from plugins.platforms.feishu.adapter import FeishuAdapter
 
     with patch.object(FeishuAdapter, "__init__", lambda self, cfg: None):
         adapter = FeishuAdapter.__new__(FeishuAdapter)
@@ -256,7 +256,7 @@ class TestWsWatchdogSettings:
     """Settings for idle threshold and watchdog interval."""
 
     def test_default_settings_values(self):
-        from gateway.platforms.feishu import FeishuAdapterSettings
+        from plugins.platforms.feishu.adapter import FeishuAdapterSettings
         import dataclasses
 
         fields = {f.name: f for f in dataclasses.fields(FeishuAdapterSettings)}
