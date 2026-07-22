@@ -222,6 +222,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch("plugins.platforms.feishu.adapter.release_scoped_lock") as release_lock,
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_start_ws_watchdog"),
         ):
             _mock_event_dispatcher_builder(mock_handler_class)
 
@@ -300,6 +301,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch("plugins.platforms.feishu.adapter.asyncio.sleep", side_effect=lambda delay: sleeps.append(delay)),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_start_ws_watchdog"),
         ):
             _mock_event_dispatcher_builder(mock_handler_class)
 
@@ -2083,6 +2085,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._card_mode_enabled = False
         captured = {"attempts": 0}
         sleeps = []
 
@@ -2544,6 +2547,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._card_mode_enabled = False
         captured = {}
 
         class _MessageAPI:
@@ -2585,6 +2589,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._card_mode_enabled = False
         captured = {}
 
         class _MessageAPI:
@@ -2713,6 +2718,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._card_mode_enabled = False
         captured = {"calls": []}
 
         class _MessageAPI:
@@ -2758,6 +2764,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._card_mode_enabled = False
         captured = {"calls": []}
 
         class _MessageAPI:
@@ -2803,6 +2810,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._card_mode_enabled = False
         captured = {}
 
         class _MessageAPI:
@@ -4566,12 +4574,8 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         event = adapter._dispatch_inbound_event.call_args.args[0]
         self.assertEqual(event.text, "stop pinging @Hermes please")
 
-    def test_pure_self_mention_message_is_ignored(self):
-        """A message containing only '@Bot' (no body, no media) must not dispatch.
-
-        Regression guard: the rendered '@Hermes' slips past the pre-strip empty
-        guard; the post-strip guard must catch it.
-        """
+    def test_pure_self_mention_message_dispatches_ping(self):
+        """A group message containing only '@Bot' dispatches an explicit ping."""
         adapter = self._build_adapter()
         bot_mention = SimpleNamespace(
             key="@_user_1",
@@ -4594,7 +4598,9 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
                 chat_type="group", message_id="m5",
             )
         )
-        adapter._dispatch_inbound_event.assert_not_called()
+        adapter._dispatch_inbound_event.assert_awaited_once()
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.text, "（被 @，请响应）")
 
 
 class TestFeishuFetchMessageText(unittest.TestCase):
@@ -4955,7 +4961,7 @@ class TestFeishuDmQuoteReplyThreadRouting(unittest.TestCase):
 
     def _run_inbound(self, chat_type, *, thread_id=None, root_id=None, parent_id=None):
         from gateway.config import PlatformConfig
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
         adapter._dispatch_inbound_event = AsyncMock()

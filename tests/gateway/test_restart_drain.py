@@ -301,13 +301,13 @@ async def test_shutdown_notification_sent_to_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 1
-    assert "shutting down" in adapter.sent[0]
-    assert "interrupted" in adapter.sent[0]
+    assert "正在关闭" in adapter.sent[0]
+    assert "当前任务将被中断" in adapter.sent[0]
 
 
 @pytest.mark.asyncio
 async def test_shutdown_notification_says_restarting_when_restart_requested():
-    """When _restart_requested is True, the message says 'restarting' and mentions /retry."""
+    """Restart notifications explain that interrupted work may be resumed."""
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:dm:999"
@@ -316,8 +316,8 @@ async def test_shutdown_notification_says_restarting_when_restart_requested():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 1
-    assert "restarting" in adapter.sent[0]
-    assert "resume" in adapter.sent[0]
+    assert "正在重启" in adapter.sent[0]
+    assert "尝试从中断处继续" in adapter.sent[0]
 
 
 @pytest.mark.asyncio

@@ -660,7 +660,7 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
     adapter.send.assert_awaited_once_with(
         "parent-42",
-        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        "⚠️ 网关正在关闭 — 当前任务将被中断。",
         metadata={"thread_id": "topic-7"},
     )
 
@@ -681,7 +681,7 @@ async def test_restart_shutdown_notification_anchors_telegram_dm_topic():
 
     call = adapter.send.await_args
     assert call.args[0] == "123456"
-    assert "Gateway restarting" in call.args[1]
+    assert "网关正在重启" in call.args[1]
     assert call.kwargs["metadata"] == {
         "thread_id": "20197",
         "telegram_dm_topic_reply_fallback": True,

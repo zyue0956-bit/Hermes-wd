@@ -1671,7 +1671,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child = MagicMock()
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-b"
-        child._credential_pool.current.return_value = leased_entry
+        child._credential_pool.get_leased_credential.return_value = leased_entry
         child.run_conversation.return_value = {
             "final_response": "done",
             "completed": True,
@@ -1689,8 +1689,101 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         child._credential_pool.acquire_lease.assert_called_once_with()
+        child._credential_pool.get_leased_credential.assert_called_once_with("cred-b")
+        child._credential_pool.current.assert_not_called()
         child._swap_credential.assert_called_once_with(leased_entry)
         child._credential_pool.release_lease.assert_called_once_with("cred-b")
+
+    def test_concurrent_children_bind_their_exact_lease_ids(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from tools.delegate_tool import _run_single_child
+
+        class RacingPool:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._next = 0
+                self._barrier = threading.Barrier(2)
+                self.entries = {
+                    "cred-1": MagicMock(id="cred-1"),
+                    "cred-2": MagicMock(id="cred-2"),
+                }
+                self.released = []
+
+            def acquire_lease(self):
+                with self._lock:
+                    self._next += 1
+                    credential_id = f"cred-{self._next}"
+                self._barrier.wait(timeout=2)
+                return credential_id
+
+            def get_leased_credential(self, credential_id):
+                return self.entries[credential_id]
+
+            def release_lease(self, credential_id):
+                with self._lock:
+                    self.released.append(credential_id)
+
+        pool = RacingPool()
+        children = []
+        for index in range(2):
+            child = MagicMock()
+            child._subagent_id = f"sa-race-{index}"
+            child._delegate_saved_tool_names = []
+            child._delegate_role = "leaf"
+            child.tool_progress_callback = None
+            child._credential_pool = pool
+            child.run_conversation.return_value = {
+                "final_response": "done", "completed": True,
+                "interrupted": False, "api_calls": 1, "messages": [],
+            }
+            children.append(child)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(
+                lambda pair: _run_single_child(
+                    task_index=pair[0], goal="race", child=pair[1],
+                    parent_agent=_make_mock_parent(),
+                ),
+                enumerate(children),
+            ))
+
+        self.assertEqual([item["status"] for item in results], ["completed", "completed"])
+        bound_ids = sorted(
+            child._swap_credential.call_args.args[0].id for child in children
+        )
+        self.assertEqual(bound_ids, ["cred-1", "cred-2"])
+        self.assertEqual(sorted(pool.released), ["cred-1", "cred-2"])
+
+    def test_credential_resolution_or_swap_failure_is_fail_closed(self):
+        from tools.delegate_tool import _run_single_child
+
+        for failure_point in ("resolve", "swap"):
+            with self.subTest(failure_point=failure_point):
+                child = MagicMock()
+                child._subagent_id = f"sa-{failure_point}"
+                child._delegate_saved_tool_names = []
+                child._delegate_role = "leaf"
+                child.tool_progress_callback = None
+                child._credential_pool.acquire_lease.return_value = "cred-b"
+                if failure_point == "resolve":
+                    child._credential_pool.get_leased_credential.side_effect = RuntimeError(
+                        "lookup failed"
+                    )
+                else:
+                    child._credential_pool.get_leased_credential.return_value = MagicMock(
+                        id="cred-b"
+                    )
+                    child._swap_credential.side_effect = RuntimeError("swap failed")
+
+                result = _run_single_child(
+                    task_index=0, goal="must not run", child=child,
+                    parent_agent=_make_mock_parent(),
+                )
+
+                self.assertEqual(result["status"], "error")
+                child.run_conversation.assert_not_called()
+                child._credential_pool.release_lease.assert_called_once_with("cred-b")
+                child.close.assert_called_once_with()
 
     def test_run_single_child_releases_lease_after_failure(self):
         from tools.delegate_tool import _run_single_child
@@ -1698,7 +1791,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child = MagicMock()
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-a"
-        child._credential_pool.current.return_value = MagicMock(id="cred-a")
+        child._credential_pool.get_leased_credential.return_value = MagicMock(id="cred-a")
         child.run_conversation.side_effect = RuntimeError("boom")
 
         result = _run_single_child(
@@ -2793,6 +2886,784 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+
+
+class TestDelegationLifecycleIntegration:
+    def test_workspace_hint_reuses_authoritative_task_cwd(self, tmp_path):
+        import tools.delegate_tool as dt
+        from tools.terminal_tool import (
+            clear_task_env_overrides,
+            register_task_env_overrides,
+        )
+
+        parent = _make_mock_parent()
+        parent._current_task_id = "session:a"
+        registered = tmp_path / "registered"
+        live = tmp_path / "live"
+        registered.mkdir()
+        live.mkdir()
+        register_task_env_overrides("session:a", {"cwd": str(registered)})
+        try:
+            with patch.dict(os.environ, {"TERMINAL_CWD": "."}), patch(
+                "tools.file_tools._get_live_tracking_cwd", return_value=str(live)
+            ):
+                assert dt._resolve_workspace_hint(parent) == str(live.resolve())
+        finally:
+            clear_task_env_overrides("session:a")
+
+    def test_workspace_hint_does_not_fallback_to_process_cwd(self, tmp_path):
+        from pathlib import Path
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        parent._current_task_id = "unknown-task"
+        with patch.dict(os.environ, {"TERMINAL_CWD": "."}), patch(
+            "tools.file_tools._get_live_tracking_cwd", return_value=None
+        ), patch(
+            "tools.file_tools._registered_task_cwd_override", return_value=None
+        ), patch(
+            "tools.file_tools._configured_terminal_cwd", return_value=None
+        ), patch.object(Path, "cwd", return_value=tmp_path):
+            assert dt._resolve_workspace_hint(parent) is None
+
+    def test_workspace_hint_uses_current_session_when_task_id_missing(self, tmp_path):
+        import tools.delegate_tool as dt
+        from tools.approval import reset_current_session_key, set_current_session_key
+        from tools.terminal_tool import (
+            clear_task_env_overrides,
+            register_task_env_overrides,
+        )
+
+        parent = _make_mock_parent()
+        parent._current_task_id = None
+        registered = tmp_path / "registered"
+        registered.mkdir()
+        register_task_env_overrides("session:b", {"cwd": str(registered)})
+        token = set_current_session_key("session:b")
+        try:
+            with patch.dict(os.environ, {"TERMINAL_CWD": "."}):
+                assert dt._resolve_workspace_hint(parent) == str(registered.resolve())
+        finally:
+            reset_current_session_key(token)
+            clear_task_env_overrides("session:b")
+
+    def test_task_aware_workspace_resolution_drives_real_lock(self, tmp_path):
+        from tools import async_delegation as ad
+        import tools.delegate_tool as dt
+        from tools.terminal_tool import (
+            clear_task_env_overrides,
+            register_task_env_overrides,
+        )
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        gate = threading.Event()
+        parents = [_make_mock_parent(), _make_mock_parent()]
+        parents[0]._current_task_id = "session:a"
+        parents[1]._current_task_id = "session:b"
+        for task_id in ("session:a", "session:b"):
+            register_task_env_overrides(task_id, {"cwd": str(shared)})
+
+        def runner():
+            gate.wait(timeout=5)
+            return {"status": "completed"}
+
+        try:
+            with patch.dict(os.environ, {"TERMINAL_CWD": "."}):
+                paths = [dt._resolve_workspace_hint(parent) for parent in parents]
+            assert paths == [str(shared.resolve()), str(shared.resolve())]
+            first = ad.dispatch_async_delegation(
+                goal="first", context=None, toolsets=["file"], role="leaf",
+                model="m", session_key="session:a", runner=runner,
+                workspace_path=paths[0], workspace_mode="write",
+                max_async_children=3,
+            )
+            second = ad.dispatch_async_delegation(
+                goal="second", context=None, toolsets=["file"], role="leaf",
+                model="m", session_key="session:b", runner=runner,
+                workspace_path=paths[1], workspace_mode="write",
+                max_async_children=3,
+            )
+            assert first["status"] == "dispatched"
+            assert second["reason_code"] == "workspace_locked"
+        finally:
+            gate.set()
+            clear_task_env_overrides("session:a")
+            clear_task_env_overrides("session:b")
+            ad._reset_for_tests()
+
+    def test_child_workspace_override_matches_lock_and_cleans_up(self, tmp_path):
+        import tools.delegate_tool as dt
+        from tools.file_tools import _resolve_base_dir
+        from tools.terminal_tool import resolve_task_overrides
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        child = MagicMock()
+        child._subagent_id = "sa-workspace-test"
+
+        dt._register_child_workspace_override(child, str(workspace))
+        assert _resolve_base_dir("sa-workspace-test") == workspace.resolve()
+        assert resolve_task_overrides("sa-workspace-test")["cwd"] == str(workspace)
+
+        dt._clear_child_workspace_override(child)
+        assert "cwd" not in resolve_task_overrides("sa-workspace-test")
+
+    def test_concurrent_child_workspace_overrides_do_not_cross_cwd(self, tmp_path):
+        import tools.delegate_tool as dt
+        from tools import file_tools, terminal_tool
+
+        workspace_a = tmp_path / "a"
+        workspace_b = tmp_path / "b"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+        default_env = MagicMock()
+        default_env.cwd = str(tmp_path / "default")
+        child_a = MagicMock(_subagent_id="sa-a")
+        child_b = MagicMock(_subagent_id="sa-b")
+
+        with patch.dict(terminal_tool._active_environments, {"default": default_env}, clear=True), \
+             patch.dict(file_tools._file_ops_cache, {}, clear=True):
+            try:
+                dt._register_child_workspace_override(child_a, str(workspace_a))
+                dt._register_child_workspace_override(child_b, str(workspace_b))
+
+                assert terminal_tool._resolve_container_task_id("sa-a") == "default"
+                assert terminal_tool._resolve_container_task_id("sa-b") == "default"
+                assert default_env.cwd == str(tmp_path / "default")
+                assert file_tools._resolve_base_dir("sa-a") == workspace_a.resolve()
+                assert file_tools._resolve_base_dir("sa-b") == workspace_b.resolve()
+            finally:
+                dt._clear_child_workspace_override(child_a)
+                dt._clear_child_workspace_override(child_b)
+
+    def test_write_delegation_rejects_missing_authoritative_workspace(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="session:test"), \
+             patch.object(dt, "_resolve_workspace_hint", return_value=None), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+             patch.object(dt, "_build_child_agent") as build_child:
+            result = json.loads(dt.delegate_task(
+                goal="edit code", toolsets=["file"], background=True,
+                parent_agent=parent,
+            ))
+
+        assert "authoritative workspace" in result["error"]
+        build_child.assert_not_called()
+
+    def test_workspace_mode_is_read_only_for_explicit_read_toolsets(self):
+        from tools.delegate_tool import _resolve_workspace_mode
+
+        assert _resolve_workspace_mode([{"goal": "a", "toolsets": ["web"]}]) == "read"
+        assert _resolve_workspace_mode(
+            [{"goal": "a", "toolsets": ["browser", "search"]}]
+        ) == "read"
+
+    def test_workspace_mode_is_conservative_for_write_or_inherited_tools(self):
+        from tools.delegate_tool import _resolve_workspace_mode
+
+        assert _resolve_workspace_mode([{"goal": "a"}]) == "write"
+        for toolset in ("terminal", "file", "computer_use", "coding", "skills"):
+            assert _resolve_workspace_mode(
+                [{"goal": "a", "toolsets": [toolset]}]
+            ) == "write"
+        assert _resolve_workspace_mode(
+            [
+                {"goal": "read", "toolsets": ["web"]},
+                {"goal": "write", "toolsets": ["file"]},
+            ]
+        ) == "write"
+
+    def test_activity_fn_uses_latest_child_activity(self):
+        from tools.delegate_tool import _build_delegation_activity_fn
+
+        older = MagicMock()
+        older.get_activity_summary.return_value = {
+            "last_activity_ts": 100.0,
+            "last_activity_desc": "older",
+            "current_tool": None,
+            "api_call_count": 2,
+        }
+        newer = MagicMock()
+        newer.get_activity_summary.return_value = {
+            "last_activity_ts": 200.0,
+            "last_activity_desc": "newer",
+            "current_tool": "terminal",
+            "api_call_count": 4,
+        }
+
+        snapshot = _build_delegation_activity_fn([older, newer])()
+        assert snapshot["last_activity_ts"] == 200.0
+        assert snapshot["last_activity_desc"] == "newer"
+        assert snapshot["current_tool"] == "terminal"
+        assert snapshot["api_call_count"] == 6
+
+    def test_background_dispatch_passes_workspace_mode_and_activity(self, tmp_path):
+        import pytest
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        fake_child.get_activity_summary.return_value = {
+            "last_activity_ts": 123.0,
+            "last_activity_desc": "working",
+            "current_tool": None,
+            "api_call_count": 1,
+        }
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        captured = {}
+
+        def fake_dispatch(**kwargs):
+            captured.update(kwargs)
+            return {"status": "dispatched", "delegation_id": "deleg_test"}
+
+        with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="session:test"), \
+             patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
+             patch.object(dt, "_build_child_agent", return_value=fake_child), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+             patch("tools.async_delegation.dispatch_async_delegation_batch", side_effect=fake_dispatch):
+            result = json.loads(dt.delegate_task(
+                goal="research", toolsets=["web"], background=True, parent_agent=parent
+            ))
+
+        assert result["status"] == "dispatched"
+        assert captured["workspace_path"] == str(tmp_path)
+        assert captured["workspace_mode"] == "read"
+        assert captured["activity_fn"]()["last_activity_ts"] == 123.0
+
+        fake_child.interrupt.side_effect = RuntimeError("cannot stop")
+        with pytest.raises(RuntimeError, match="Failed to interrupt 1/1"):
+            captured["interrupt_fn"]()
+
+    def test_write_schedule_or_capacity_rejection_never_runs_sync_fallback(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        for reason_code in ("schedule_failed", "capacity_reached"):
+            parent = _make_mock_parent()
+            child = MagicMock()
+            child._subagent_id = f"sa-{reason_code}"
+            child._delegate_role = "leaf"
+            child._delegate_workspace_task_id = None
+            rejected = {
+                "status": "rejected",
+                "reason_code": reason_code,
+                "error": f"{reason_code} injected",
+            }
+            with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+                 patch("gateway.session_context.async_delivery_supported", return_value=True), \
+                 patch("tools.approval.get_current_session_key", return_value="session:test"), \
+                 patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
+                 patch.object(dt, "_build_child_agent", return_value=child), \
+                 patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+                 patch("tools.async_delegation.dispatch_async_delegation_batch", return_value=rejected), \
+                 patch.object(dt, "_run_single_child") as run_child:
+                result = json.loads(dt.delegate_task(
+                    goal="write", toolsets=["file"], background=True,
+                    parent_agent=parent,
+                ))
+
+            assert result["reason_code"] == reason_code
+            run_child.assert_not_called()
+            child.close.assert_called_once()
+
+    def test_read_only_capacity_rejection_keeps_sync_fallback(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child._subagent_id = "sa-read-fallback"
+        child._delegate_role = "leaf"
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        completed = {
+            "task_index": 0, "status": "completed", "summary": "ok",
+            "api_calls": 0, "duration_seconds": 0.01, "model": "m",
+            "exit_reason": "completed",
+        }
+        rejected = {
+            "status": "rejected", "reason_code": "capacity_reached",
+            "error": "capacity injected",
+        }
+        with patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="session:test"), \
+             patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)), \
+             patch.object(dt, "_build_child_agent", return_value=child), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+             patch("tools.async_delegation.dispatch_async_delegation_batch", return_value=rejected), \
+             patch.object(dt, "_run_single_child", return_value=completed) as run_child:
+            result = json.loads(dt.delegate_task(
+                goal="read", toolsets=["web"], background=True,
+                parent_agent=parent,
+            ))
+
+        assert result["results"][0]["status"] == "completed"
+        run_child.assert_called_once()
+
+    def test_real_write_schedule_and_capacity_failures_never_run_sync(self, tmp_path):
+        from contextlib import ExitStack
+        from tools import async_delegation as ad
+        import tools.delegate_tool as dt
+
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        write_workspace = tmp_path / "write"
+        read_workspace = tmp_path / "read"
+        write_workspace.mkdir()
+        read_workspace.mkdir()
+
+        def invoke(extra_patches=()):
+            parent = _make_mock_parent()
+            child = MagicMock()
+            child._subagent_id = "sa-real-rejection"
+            child._delegate_role = "leaf"
+            child._delegate_workspace_task_id = None
+            patches = [
+                patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}),
+                patch("gateway.session_context.async_delivery_supported", return_value=True),
+                patch("tools.approval.get_current_session_key", return_value="session:test"),
+                patch.object(dt, "_resolve_workspace_hint", return_value=str(write_workspace)),
+                patch.object(dt, "_build_child_agent", return_value=child),
+                patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
+                patch.object(dt, "_run_single_child"),
+                *extra_patches,
+            ]
+            with ExitStack() as stack:
+                entered = [stack.enter_context(item) for item in patches]
+                result = json.loads(dt.delegate_task(
+                    goal="write", toolsets=["file"], background=True,
+                    parent_agent=parent,
+                ))
+            return result, child, entered[6]
+
+        gate = None
+        try:
+            schedule, schedule_child, schedule_run = invoke((
+                patch.object(ad, "_get_executor", side_effect=RuntimeError("init failed")),
+            ))
+            assert schedule["reason_code"] == "schedule_failed"
+            schedule_run.assert_not_called()
+            schedule_child.close.assert_called_once()
+            assert ad.active_count() == 0
+
+            gate = threading.Event()
+            holder = ad.dispatch_async_delegation(
+                goal="read holder", context=None, toolsets=["web"], role="leaf",
+                model="m", session_key="holder",
+                runner=lambda: (gate.wait(timeout=5), {"status": "completed"})[1],
+                workspace_path=str(read_workspace), workspace_mode="read",
+                max_async_children=1,
+            )
+            assert holder["status"] == "dispatched"
+            capacity, capacity_child, capacity_run = invoke((
+                patch.object(dt, "_get_max_async_children", return_value=1),
+            ))
+            assert capacity["reason_code"] == "capacity_reached"
+            capacity_run.assert_not_called()
+            capacity_child.close.assert_called_once()
+        finally:
+            if gate is not None:
+                gate.set()
+            ad._reset_for_tests()
+
+    def test_sync_batch_business_submit_failure_runs_every_child_once(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        class FailNthSubmitExecutor:
+            def __init__(self, fail_at):
+                self.fail_at = fail_at
+                self.calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def submit(self, fn, /, *args, **kwargs):
+                from concurrent.futures import Future
+
+                self.calls += 1
+                if self.calls == self.fail_at:
+                    raise RuntimeError("business submit failed")
+                future = Future()
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:
+                    future.set_exception(exc)
+                return future
+
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        for fail_at in (1, 2):
+            parent = _make_mock_parent()
+            parent._active_children = []
+            parent._active_children_lock = threading.Lock()
+            built = []
+
+            def build(**kwargs):
+                child = MagicMock()
+                child._subagent_id = f"sa-submit-{fail_at}-{len(built)}"
+                child._delegate_saved_tool_names = []
+                child._delegate_role = "leaf"
+                child.tool_progress_callback = None
+                child._credential_pool = None
+                child.model = "m"
+                child.session_id = child._subagent_id
+                child.get_activity_summary.return_value = {"api_call_count": 0}
+                child.run_conversation.return_value = {
+                    "final_response": "done", "completed": True,
+                    "interrupted": False, "api_calls": 1, "messages": [],
+                }
+                built.append(child)
+                parent._active_children.append(child)
+                return child
+
+            with (
+                patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)),
+                patch.object(dt, "_build_child_agent", side_effect=build),
+                patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
+                patch.object(
+                    dt, "_create_resilient_batch_executor",
+                    return_value=FailNthSubmitExecutor(fail_at),
+                ),
+            ):
+                result = json.loads(dt.delegate_task(
+                    tasks=[{"goal": "one"}, {"goal": "two"}, {"goal": "three"}],
+                    background=False, parent_agent=parent,
+                ))
+
+            assert [item["status"] for item in result["results"]] == [
+                "completed", "completed", "completed",
+            ]
+            assert parent._active_children == []
+            assert all(child.run_conversation.call_count == 1 for child in built)
+            assert all(child.close.call_count == 1 for child in built)
+
+    def test_sync_batch_executor_failure_falls_back_without_child_leaks(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        parent._active_children = []
+        parent._active_children_lock = threading.Lock()
+        built = []
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+
+        def build(**kwargs):
+            child = MagicMock()
+            child._subagent_id = f"sa-sync-{len(built)}"
+            child._delegate_saved_tool_names = []
+            child._delegate_role = "leaf"
+            child.tool_progress_callback = None
+            child._credential_pool = None
+            child.model = "m"
+            child.session_id = child._subagent_id
+            child.get_activity_summary.return_value = {"api_call_count": 0}
+            built.append(child)
+            parent._active_children.append(child)
+            return child
+
+        with (
+            patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)),
+            patch.object(dt, "_build_child_agent", side_effect=build),
+            patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
+            patch.object(dt, "ThreadPoolExecutor", side_effect=RuntimeError("pool failed")),
+        ):
+            result = json.loads(dt.delegate_task(
+                tasks=[{"goal": "one"}, {"goal": "two"}],
+                background=False, parent_agent=parent,
+            ))
+
+        assert len(result["results"]) == 2
+        assert all(item["status"] == "error" for item in result["results"])
+        assert parent._active_children == []
+        assert all(child.close.call_count == 1 for child in built)
+
+    def test_background_dispatch_rejects_missing_session_owner(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        with patch(
+            "tools.approval.get_current_session_key",
+            side_effect=RuntimeError("context unavailable"),
+        ), patch(
+            "gateway.session_context.async_delivery_supported", return_value=True
+        ), patch.object(dt, "_build_child_agent") as build_child:
+            result = json.loads(dt.delegate_task(
+                goal="edit", toolsets=["file"], background=True,
+                parent_agent=parent,
+            ))
+
+        assert result["reason_code"] == "session_owner_unavailable"
+        build_child.assert_not_called()
+
+    def test_child_build_failure_tears_down_previously_built_children(self, tmp_path):
+        import pytest
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        first = MagicMock()
+        first._subagent_id = "sa-first"
+        first._delegate_role = "leaf"
+        parent._active_children = []
+        parent._active_children_lock = threading.Lock()
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+
+        def build(**kwargs):
+            if not parent._active_children:
+                parent._active_children.append(first)
+                return first
+            raise RuntimeError("second build failed")
+
+        with (
+            patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)),
+            patch.object(dt, "_build_child_agent", side_effect=build),
+            patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
+            pytest.raises(RuntimeError, match="second build failed"),
+        ):
+            dt.delegate_task(
+                tasks=[{"goal": "one"}, {"goal": "two"}],
+                background=False, parent_agent=parent,
+            )
+
+        first.close.assert_called_once_with()
+        assert first not in parent._active_children
+
+    def test_capacity_fallback_restores_parent_interrupt_ownership(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        fake_child = MagicMock()
+        fake_child._subagent_id = "sa-capacity"
+        fake_child._delegate_role = "leaf"
+        parent._active_children = [fake_child]
+        parent._active_children_lock = threading.Lock()
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        rejected = {
+            "status": "rejected", "reason_code": "capacity",
+            "error": "capacity reached",
+        }
+        ownership_seen = []
+
+        def run_sync(*args, **kwargs):
+            ownership_seen.append(fake_child in parent._active_children)
+            return {"task_index": 0, "status": "completed", "summary": "ok"}
+
+        try:
+            with (
+                patch.dict(os.environ, {"HERMES_SESSION_KEY": "session:test"}),
+                patch("gateway.session_context.async_delivery_supported", return_value=True),
+                patch("tools.approval.get_current_session_key", return_value="session:test"),
+                patch.object(dt, "_resolve_workspace_hint", return_value=str(tmp_path)),
+                patch.object(dt, "_build_child_agent", return_value=fake_child),
+                patch.object(dt, "_resolve_delegation_credentials", return_value=creds),
+                patch.object(dt, "_run_single_child", side_effect=run_sync),
+                patch(
+                    "tools.async_delegation.dispatch_async_delegation_batch",
+                    return_value=rejected,
+                ),
+            ):
+                result = json.loads(dt.delegate_task(
+                    goal="research", toolsets=["web"], background=True,
+                    parent_agent=parent,
+                ))
+        finally:
+            dt._clear_child_workspace_override(fake_child)
+
+        assert result["results"][0]["status"] == "completed"
+        assert ownership_seen == [True]
+
+    def test_workspace_lock_rejection_does_not_fallback_to_sync(self, tmp_path):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        creds = {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        }
+        rejected = {
+            "status": "rejected",
+            "reason_code": "workspace_unavailable",
+            "holder_delegation_id": "deleg_holder",
+            "error": "workspace unavailable",
+        }
+
+        with patch.dict(
+                 os.environ,
+                 {
+                     "TERMINAL_CWD": str(tmp_path),
+                     "HERMES_SESSION_KEY": "session:test",
+                 },
+             ), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="session:test"), \
+             patch.object(dt, "_build_child_agent", return_value=fake_child), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+             patch.object(dt, "_run_single_child") as run_child, \
+             patch("tools.async_delegation.dispatch_async_delegation_batch", return_value=rejected):
+            result = json.loads(dt.delegate_task(
+                goal="edit code", toolsets=["file"], background=True, parent_agent=parent
+            ))
+
+        assert "workspace unavailable" in result["error"]
+        assert result["reason_code"] == "workspace_unavailable"
+        assert result["holder_delegation_id"] == "deleg_holder"
+        run_child.assert_not_called()
+
+
+    def test_delegate_task_honors_session_scoped_pause(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        dt.set_spawn_paused(True, "session:a")
+        try:
+            with patch(
+                "tools.approval.get_current_session_key", return_value="session:a"
+            ), patch.object(dt, "_build_child_agent") as build_child:
+                result = json.loads(dt.delegate_task(
+                    goal="should not start", parent_agent=parent
+                ))
+        finally:
+            dt.set_spawn_paused(False, "session:a")
+
+        assert "spawning is paused" in result["error"]
+        build_child.assert_not_called()
+
+    def test_workspace_rejection_tears_down_child_lifecycle(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session"
+        parent._current_turn_id = "turn-1"
+        child = MagicMock()
+        parent._active_children = [child]
+        parent._active_children_lock = threading.Lock()
+        child.session_id = "child-session"
+        child._delegate_role = "leaf"
+        child.tool_progress_callback = MagicMock()
+
+        with patch("hermes_cli.plugins.invoke_hook") as invoke_hook:
+            dt._teardown_rejected_children(
+                [child], parent, reason="workspace locked"
+            )
+
+        child.tool_progress_callback.assert_called_once()
+        assert child.tool_progress_callback.call_args.args[0] == "subagent.complete"
+        child.close.assert_called_once_with()
+        assert child not in parent._active_children
+        invoke_hook.assert_called_once()
+        assert invoke_hook.call_args.args[0] == "subagent_stop"
+        assert invoke_hook.call_args.kwargs["child_status"] == "rejected"
+
+    def test_run_child_preflight_lease_failure_still_tears_down(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child._subagent_id = "sa-lease-fail"
+        child._delegate_saved_tool_names = []
+        child._delegate_role = "leaf"
+        child.tool_progress_callback = None
+        pool = MagicMock()
+        pool.acquire_lease.side_effect = RuntimeError("lease unavailable")
+        child._credential_pool = pool
+        parent._active_children = [child]
+        parent._active_children_lock = threading.Lock()
+
+        result = dt._run_single_child(
+            task_index=0, goal="lease failure", child=child, parent_agent=parent
+        )
+
+        assert result["status"] == "error"
+        child.close.assert_called_once_with()
+        assert child not in parent._active_children
+
+    def test_run_child_teardown_continues_when_override_cleanup_fails(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child._subagent_id = "sa-teardown"
+        child._delegate_saved_tool_names = []
+        child._delegate_role = "leaf"
+        child.tool_progress_callback = None
+        child.run_conversation.return_value = {
+            "final_response": "done", "completed": True, "api_calls": 1,
+        }
+        child.get_activity_summary.return_value = {"api_call_count": 1}
+        pool = MagicMock()
+        pool.acquire_lease.return_value = "lease-1"
+        pool.current.return_value = None
+        child._credential_pool = pool
+        parent._active_children = [child]
+        parent._active_children_lock = threading.Lock()
+
+        with patch.object(
+            dt, "_clear_child_workspace_override",
+            side_effect=RuntimeError("cleanup boom"),
+        ):
+            result = dt._run_single_child(
+                task_index=0, goal="done", child=child, parent_agent=parent
+            )
+
+        assert result["status"] == "completed"
+        pool.release_lease.assert_called_once_with("lease-1")
+        child.close.assert_called_once_with()
+        assert child not in parent._active_children
+
+    def test_rejection_teardown_continues_when_override_cleanup_fails(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        first = MagicMock()
+        second = MagicMock()
+        with patch.object(
+            dt, "_clear_child_workspace_override",
+            side_effect=[RuntimeError("cleanup failed"), None],
+        ):
+            dt._teardown_rejected_children(
+                [first, second], parent, reason="rejected"
+            )
+
+        first.close.assert_called_once_with()
+        second.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

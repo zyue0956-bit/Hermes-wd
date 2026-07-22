@@ -8,6 +8,7 @@ formatting, capacity rejection, and crash handling.
 import queue
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -206,6 +207,620 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
+def test_interrupt_by_id_only_signals_target_and_is_idempotent():
+    gates = [threading.Event(), threading.Event()]
+    interrupts = [0, 0]
+    handles = []
+
+    for index in range(2):
+        def runner(i=index):
+            gates[i].wait(timeout=5)
+            return {"status": "interrupted" if interrupts[i] else "completed"}
+
+        def interrupt_fn(i=index):
+            interrupts[i] += 1
+            gates[i].set()
+
+        handles.append(ad.dispatch_async_delegation(
+            goal=f"task-{index}", context=None, toolsets=None, role="leaf",
+            model="m", session_key="", runner=runner,
+            interrupt_fn=interrupt_fn, max_async_children=3,
+        )["delegation_id"])
+
+    result = ad.interrupt_async_delegation(handles[0], reason="test")
+    assert result["status"] in {"cancelling", "interrupted"}
+    assert result["delegation_id"] == handles[0]
+    assert interrupts == [1, 0]
+
+    repeated = ad.interrupt_async_delegation(handles[0], reason="test again")
+    assert repeated["status"] in {"cancelling", "interrupted"}
+    if repeated["status"] == "cancelling":
+        assert repeated["already_requested"] is True
+    else:
+        assert repeated["active"] is False
+    assert interrupts == [1, 0]
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["delegation_id"] == handles[0]
+    assert evt["status"] == "interrupted"
+    gates[1].set()
+
+
+def test_cancel_callback_failure_rolls_back_request_and_preserves_truth():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def interrupt_fn():
+        raise RuntimeError("cannot stop")
+
+    handle = ad.dispatch_async_delegation(
+        goal="uncancellable", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, interrupt_fn=interrupt_fn,
+    )["delegation_id"]
+
+    result = ad.interrupt_async_delegation(handle)
+    assert result["status"] == "error"
+    snapshot = ad.get_async_delegation(handle)
+    assert snapshot is not None
+    assert snapshot["status"] == "running"
+    assert snapshot["cancel_requested"] is False
+
+    gate.set()
+    event = _drain_one()
+    assert event is not None
+    assert event["status"] == "completed"
+
+
+def test_cancel_request_does_not_force_false_interrupted_status():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    handle = ad.dispatch_async_delegation(
+        goal="ignores cancel", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner,
+        interrupt_fn=gate.set,
+    )["delegation_id"]
+
+    assert ad.interrupt_async_delegation(handle)["status"] == "cancelling"
+    event = _drain_one()
+    assert event is not None
+    assert event["status"] == "completed"
+    snapshot = ad.get_async_delegation(handle)
+    assert snapshot is not None
+    assert snapshot["status"] == "completed"
+
+
+def test_snapshot_nested_values_cannot_mutate_registry():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    handle = ad.dispatch_async_delegation(
+        goal="immutable", context=None, toolsets=["web"], role="leaf",
+        model="m", session_key="s", runner=runner, max_async_children=1,
+    )
+    snap = ad.get_async_delegation(handle["delegation_id"])
+    assert snap is not None
+    snap["toolsets"].append("MUTATED")
+    fresh = ad.get_async_delegation(handle["delegation_id"])
+    assert fresh is not None
+    assert fresh["toolsets"] == ["web"]
+    gate.set()
+    assert _drain_one() is not None
+
+
+def test_finalize_is_compare_and_set_and_emits_once():
+    handle = ad.dispatch_async_delegation(
+        goal="once", context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: {"status": "completed"},
+        max_async_children=1,
+    )
+    first = _drain_one()
+    assert first is not None and first["status"] == "completed"
+    original = ad.get_async_delegation(handle["delegation_id"])
+    assert original is not None
+
+    ad._finalize(handle["delegation_id"], {"status": "error"}, "error")
+
+    assert _drain_one(timeout=0.05) is None
+    fresh = ad.get_async_delegation(handle["delegation_id"])
+    assert fresh is not None
+    assert fresh["status"] == "completed"
+    assert fresh["completed_at"] == original["completed_at"]
+
+
+def test_single_empty_or_unknown_result_fails_closed():
+    for result in ({}, {"status": "surprise"}):
+        handle = ad.dispatch_async_delegation(
+            goal="invalid", context=None, toolsets=None, role="leaf", model="m",
+            session_key="s", runner=lambda value=result: value,
+            max_async_children=1,
+        )
+        event = _drain_one()
+        assert event is not None
+        assert event["delegation_id"] == handle["delegation_id"]
+        assert event["status"] == "error"
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        [],
+        [None, {"task_index": 1, "status": "completed"}],
+        [{"task_index": 0, "status": "completed"}],
+        [
+            {"task_index": 0, "status": "completed"},
+            {"task_index": 0, "status": "completed"},
+        ],
+        [
+            {"task_index": 0, "status": "completed"},
+            {"task_index": 1, "status": "surprise"},
+        ],
+    ],
+)
+def test_batch_malformed_or_incomplete_results_fail_closed(results):
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: {"results": results},
+        max_async_children=1,
+    )
+    event = _drain_one()
+    assert event is not None
+    assert event["delegation_id"] == handle["delegation_id"]
+    assert event["status"] == "error"
+    assert all(isinstance(item, dict) for item in event["results"])
+
+
+def test_formatter_tolerates_malformed_batch_items():
+    from tools.process_registry import _format_async_delegation
+
+    text = _format_async_delegation({
+        "type": "async_delegation",
+        "delegation_id": "deleg_bad",
+        "is_batch": True,
+        "goals": ["a", "b"],
+        "results": [None, {"task_index": 1, "status": "completed", "summary": "ok"}],
+        "status": "error",
+    })
+    assert "deleg_bad" in text
+    assert "TASK 2/2" in text
+    assert "ok" in text
+
+
+def test_executor_initialization_failure_rolls_back_single_and_batch(tmp_path):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    with patch.object(ad, "_get_executor", side_effect=RuntimeError("executor init failed")):
+        single = ad.dispatch_async_delegation(
+            goal="one", context=None, toolsets=None, role="leaf", model="m",
+            session_key="s", runner=lambda: {"status": "completed"},
+            workspace_path=str(workspace), workspace_mode="write",
+        )
+        batch = ad.dispatch_async_delegation_batch(
+            goals=["a"], context=None, toolsets=None, role="leaf",
+            model="m", session_key="s",
+            runner=lambda: {
+                "results": [{"task_index": 0, "status": "completed"}]
+            },
+            workspace_path=str(workspace), workspace_mode="write",
+        )
+
+    assert single["status"] == "rejected"
+    assert single["reason_code"] == "schedule_failed"
+    assert batch["status"] == "rejected"
+    assert batch["reason_code"] == "schedule_failed"
+    assert ad.active_count() == 0
+
+    admitted = ad.dispatch_async_delegation(
+        goal="retry", context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: {"status": "completed"},
+        workspace_path=str(workspace), workspace_mode="write",
+    )
+    assert admitted["status"] == "dispatched"
+    assert _drain_one() is not None
+
+
+def test_thread_start_failure_never_runs_rejected_runner(monkeypatch, tmp_path):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    rejected_runner_ran = threading.Event()
+    original_start = threading.Thread.start
+    async_start_count = 0
+
+    def fail_first_async_worker(thread):
+        nonlocal async_start_count
+        if thread.name.startswith("async-delegate"):
+            async_start_count += 1
+            if async_start_count == 1:
+                raise RuntimeError("thread start failed")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_first_async_worker)
+    rejected = ad.dispatch_async_delegation(
+        goal="ghost", context=None, toolsets=None, role="leaf", model="m",
+        session_key="s",
+        runner=lambda: (
+            rejected_runner_ran.set() or {"status": "completed"}
+        ),
+        workspace_path=str(workspace), workspace_mode="write",
+        max_async_children=2,
+    )
+    assert rejected["status"] == "rejected"
+    assert rejected["reason_code"] == "schedule_failed"
+
+    monkeypatch.setattr(threading.Thread, "start", original_start)
+    retry = ad.dispatch_async_delegation(
+        goal="retry", context=None, toolsets=None, role="leaf", model="m",
+        session_key="s", runner=lambda: {"status": "completed"},
+        workspace_path=str(workspace), workspace_mode="write",
+        max_async_children=2,
+    )
+    assert retry["status"] == "dispatched"
+    assert _drain_one() is not None
+    time.sleep(0.05)
+    assert rejected_runner_ran.is_set() is False
+
+
+def test_interrupt_by_id_reports_unknown_and_completed():
+    assert ad.interrupt_async_delegation("deleg_missing")["status"] == "not_found"
+
+    handle = ad.dispatch_async_delegation(
+        goal="quick", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: {"status": "completed"},
+    )["delegation_id"]
+    assert _drain_one() is not None
+
+    result = ad.interrupt_async_delegation(handle)
+    assert result["status"] == "completed"
+    assert result["active"] is False
+
+
+def test_stalled_status_is_derived_from_child_activity_and_can_recover():
+    gate = threading.Event()
+    activity = {"last_activity_ts": 100.0, "last_activity_desc": "waiting", "current_tool": None}
+    handle = ad.dispatch_async_delegation(
+        goal="slow", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: (gate.wait(timeout=5) or {"status": "completed"}),
+        activity_fn=lambda: dict(activity),
+    )["delegation_id"]
+
+    stalled = ad.get_async_delegation(
+        handle, now=400.0, stalled_after_seconds=180.0
+    )
+    assert stalled["status"] == "stalled"
+    assert stalled["last_activity_at"] == 100.0
+    assert stalled["seconds_since_activity"] == 300.0
+
+    activity["last_activity_ts"] = 390.0
+    running = ad.get_async_delegation(
+        handle, now=400.0, stalled_after_seconds=180.0
+    )
+    assert running["status"] == "running"
+    assert running["seconds_since_activity"] == 10.0
+    gate.set()
+
+
+@pytest.mark.parametrize("workspace_path", [None, "/definitely/missing/hermes-workspace"])
+def test_write_dispatch_rejects_unavailable_workspace(workspace_path):
+    result = ad.dispatch_async_delegation(
+        goal="unsafe write", context=None, toolsets=["file"], role="leaf",
+        model="m", session_key="", runner=lambda: {"status": "completed"},
+        workspace_path=workspace_path, workspace_mode="write",
+    )
+    assert result["status"] == "rejected"
+    assert result["reason_code"] == "workspace_unavailable"
+    assert ad.active_count() == 0
+
+
+def test_workspace_lock_allows_read_read_and_different_workspaces(tmp_path):
+    gate = threading.Event()
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "other").mkdir()
+    kwargs = dict(
+        context=None, toolsets=["web"], role="leaf", model="m", session_key="",
+        runner=lambda: (gate.wait(timeout=5) or {"status": "completed"}),
+        max_async_children=4,
+    )
+    first = ad.dispatch_async_delegation(
+        goal="read-a", workspace_path=str(tmp_path / "repo"), workspace_mode="read", **kwargs
+    )
+    second = ad.dispatch_async_delegation(
+        goal="read-b", workspace_path=str(tmp_path / "repo"), workspace_mode="read", **kwargs
+    )
+    third = ad.dispatch_async_delegation(
+        goal="write-other", workspace_path=str(tmp_path / "other"), workspace_mode="write", **kwargs
+    )
+    assert [first["status"], second["status"], third["status"]] == [
+        "dispatched", "dispatched", "dispatched"
+    ]
+    gate.set()
+
+
+@pytest.mark.parametrize(
+    ("first_mode", "second_mode"),
+    [("write", "read"), ("read", "write"), ("write", "write")],
+)
+def test_workspace_lock_rejects_conflicting_modes(tmp_path, first_mode, second_mode):
+    gate = threading.Event()
+    (tmp_path / "repo").mkdir()
+    kwargs = dict(
+        context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (gate.wait(timeout=5) or {"status": "completed"}),
+        max_async_children=3,
+    )
+    first = ad.dispatch_async_delegation(
+        goal="first", workspace_path=str(tmp_path / "repo"), workspace_mode=first_mode, **kwargs
+    )
+    second = ad.dispatch_async_delegation(
+        goal="second", workspace_path=str(tmp_path / "repo"), workspace_mode=second_mode, **kwargs
+    )
+    assert first["status"] == "dispatched"
+    assert second["status"] == "rejected"
+    assert second["reason_code"] == "workspace_locked"
+    assert second["holder_delegation_id"] == first["delegation_id"]
+    gate.set()
+
+
+def test_different_workspace_writes_share_global_write_lease(tmp_path):
+    gate = threading.Event()
+    (tmp_path / "repo-a").mkdir()
+    (tmp_path / "repo-b").mkdir()
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def dispatch(goal, workspace):
+        return ad.dispatch_async_delegation(
+            goal=goal, context=None, toolsets=["file"], role="leaf", model="m",
+            session_key="", runner=runner,
+            max_async_children=3, workspace_mode="write",
+            workspace_path=str(workspace),
+        )
+
+    first = dispatch("write-a", tmp_path / "repo-a")
+    second = dispatch("write-b", tmp_path / "repo-b")
+    assert first["status"] == "dispatched"
+    assert second["status"] == "rejected"
+    assert second["reason_code"] == "workspace_locked"
+    gate.set()
+
+
+def test_workspace_lock_is_released_after_completion(tmp_path):
+    (tmp_path / "repo").mkdir()
+    repo = str(tmp_path / "repo")
+    first = ad.dispatch_async_delegation(
+        goal="first", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: {"status": "completed"},
+        workspace_path=repo, workspace_mode="write",
+    )
+    assert first["status"] == "dispatched"
+    assert _drain_one() is not None
+
+    gate = threading.Event()
+    second = ad.dispatch_async_delegation(
+        goal="second", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: (gate.wait(timeout=5) or {"status": "completed"}),
+        workspace_path=repo, workspace_mode="write",
+    )
+    assert second["status"] == "dispatched"
+    gate.set()
+
+
+def test_session_owner_filters_listing_status_and_cancel(tmp_path):
+    gates = [threading.Event(), threading.Event()]
+    interrupted = [0, 0]
+    handles = []
+
+    for index, owner in enumerate(("session:a", "session:b")):
+        (tmp_path / owner).mkdir()
+
+        def runner(i=index):
+            gates[i].wait(timeout=5)
+            return {"status": "interrupted" if interrupted[i] else "completed"}
+
+        def interrupt_fn(i=index):
+            interrupted[i] += 1
+            gates[i].set()
+
+        handles.append(ad.dispatch_async_delegation(
+            goal=f"owner-{owner}", context="private", toolsets=["web"],
+            role="leaf", model="m", session_key=owner, runner=runner,
+            interrupt_fn=interrupt_fn, workspace_path=str(tmp_path / owner),
+            workspace_mode="read", max_async_children=3,
+        )["delegation_id"])
+
+    owned = ad.list_async_delegations(owner_session_key="session:a")
+    assert [record["delegation_id"] for record in owned] == [handles[0]]
+    assert "session_key" not in owned[0]
+    assert ad.get_async_delegation(
+        handles[1], owner_session_key="session:a"
+    ) is None
+
+    denied = ad.interrupt_async_delegation(
+        handles[1], owner_session_key="session:a"
+    )
+    assert denied["status"] == "not_found"
+    assert interrupted == [0, 0]
+
+    allowed = ad.interrupt_async_delegation(
+        handles[0], owner_session_key="session:a"
+    )
+    assert allowed["status"] == "cancelling"
+    assert interrupted == [1, 0]
+    assert _drain_one() is not None
+    gates[1].set()
+
+
+def test_snapshot_is_internally_consistent_during_finalize():
+    runner_gate = threading.Event()
+    activity_started = threading.Event()
+    activity_continue = threading.Event()
+
+    def runner():
+        runner_gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def activity_fn():
+        activity_started.set()
+        activity_continue.wait(timeout=5)
+        return {"last_activity_ts": time.time(), "api_call_count": 1}
+
+    handle = ad.dispatch_async_delegation(
+        goal="race", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session:a", runner=runner, activity_fn=activity_fn,
+    )["delegation_id"]
+    result = {}
+
+    thread = threading.Thread(
+        target=lambda: result.update(ad.get_async_delegation(handle) or {})
+    )
+    thread.start()
+    assert activity_started.wait(timeout=2)
+    runner_gate.set()
+    assert _drain_one() is not None
+    activity_continue.set()
+    thread.join(timeout=2)
+
+    if result["status"] == "running":
+        assert result["active"] is True
+        assert result["completed_at"] is None
+    else:
+        assert result["status"] == "completed"
+        assert result["active"] is False
+        assert result["completed_at"] is not None
+
+
+@pytest.mark.parametrize(("first_suffix", "second_suffix"), [("", "/sub"), ("/sub", "")])
+def test_workspace_lock_rejects_ancestor_descendant_overlap(
+    tmp_path, first_suffix, second_suffix
+):
+    gate = threading.Event()
+    (tmp_path / "repo" / "sub").mkdir(parents=True)
+    root = str(tmp_path / "repo")
+    kwargs = dict(
+        context=None, toolsets=["file"], role="leaf", model="m", session_key="",
+        runner=lambda: (gate.wait(timeout=5) or {"status": "completed"}),
+        workspace_mode="write", max_async_children=3,
+    )
+    first = ad.dispatch_async_delegation(
+        goal="first", workspace_path=root + first_suffix, **kwargs
+    )
+    second = ad.dispatch_async_delegation(
+        goal="second", workspace_path=root + second_suffix, **kwargs
+    )
+    assert first["status"] == "dispatched"
+    assert second["status"] == "rejected"
+    assert second["reason_code"] == "workspace_locked"
+    gate.set()
+
+
+@pytest.mark.parametrize(
+    ("child_statuses", "expected"),
+    [
+        (["completed", "completed"], "completed"),
+        (["interrupted", "interrupted"], "interrupted"),
+        (["completed", "interrupted"], "interrupted"),
+        (["completed", "error"], "error"),
+    ],
+)
+def test_batch_terminal_status_preserves_child_outcomes(child_statuses, expected):
+    result = ad.dispatch_async_delegation_batch(
+        goals=[f"task-{i}" for i in range(len(child_statuses))],
+        context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {
+            "results": [
+                {"task_index": i, "status": status}
+                for i, status in enumerate(child_statuses)
+            ]
+        },
+    )
+    event = _drain_one()
+    assert event is not None
+    assert event["delegation_id"] == result["delegation_id"]
+    assert event["status"] == expected
+    snapshot = ad.get_async_delegation(result["delegation_id"])
+    assert snapshot is not None
+    assert snapshot["status"] == expected
+
+
+def test_cancel_completion_race_returns_completed_truth():
+    runner_gate = threading.Event()
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    cancel_result = {}
+
+    def runner():
+        runner_gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def interrupt_fn():
+        callback_started.set()
+        callback_release.wait(timeout=5)
+
+    handle = ad.dispatch_async_delegation(
+        goal="race", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, interrupt_fn=interrupt_fn,
+    )["delegation_id"]
+
+    thread = threading.Thread(
+        target=lambda: cancel_result.update(ad.interrupt_async_delegation(handle))
+    )
+    thread.start()
+    assert callback_started.wait(timeout=2)
+    runner_gate.set()
+    event = _drain_one()
+    assert event is not None and event["status"] == "completed"
+    callback_release.set()
+    thread.join(timeout=2)
+
+    assert cancel_result["status"] == "completed"
+    assert cancel_result["active"] is False
+
+
+def test_cancel_callback_error_after_completion_returns_completed_truth():
+    runner_gate = threading.Event()
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    cancel_result = {}
+
+    def runner():
+        runner_gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    def interrupt_fn():
+        callback_started.set()
+        callback_release.wait(timeout=5)
+        raise RuntimeError("late failure")
+
+    handle = ad.dispatch_async_delegation(
+        goal="race error", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, interrupt_fn=interrupt_fn,
+    )["delegation_id"]
+    thread = threading.Thread(
+        target=lambda: cancel_result.update(ad.interrupt_async_delegation(handle))
+    )
+    thread.start()
+    assert callback_started.wait(timeout=2)
+    runner_gate.set()
+    event = _drain_one()
+    assert event is not None and event["status"] == "completed"
+    callback_release.set()
+    thread.join(timeout=2)
+
+    assert cancel_result["status"] == "completed"
+    assert cancel_result["active"] is False
+
+
 def test_completed_records_pruned_to_cap():
     # Run more than the retention cap quickly; ensure list doesn't grow forever.
     for i in range(ad._MAX_RETAINED_COMPLETED + 10):
@@ -258,6 +873,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     }
     # monkeypatch (not `with`) so patches outlive delegate_task's return and
     # remain active while the background worker runs.
+    monkeypatch.setenv("HERMES_SESSION_KEY", "session:test")
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
@@ -289,7 +905,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
-def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
+def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch, tmp_path):
     """A multi-item batch with background=True dispatches the WHOLE fan-out as
     ONE background unit (one handle, one async slot). The children run in
     parallel and join; the consolidated results come back as a single
@@ -326,6 +942,8 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     # Use monkeypatch (not a `with` block) so the patches stay active while the
     # background worker thread runs _execute_and_aggregate AFTER delegate_task
     # has already returned.
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_KEY", "session:test")
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", _blocking_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
@@ -422,7 +1040,7 @@ def test_run_agent_dispatch_forces_background():
         assert captured["background"] is False
 
 
-def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
+def test_delegate_task_background_detaches_child_from_parent(monkeypatch, tmp_path):
     """A background child must NOT remain in parent._active_children —
     otherwise parent-turn interrupts / cache evicts / session close would
     kill the detached subagent mid-run."""
@@ -454,7 +1072,9 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
     }
-    with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_KEY", "session:test")
+    with patch.object(dt, "_build_child_agent", side_effect=build_and_register),\
          patch.object(dt, "_run_single_child", side_effect=slow_child), \
          patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
         out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)

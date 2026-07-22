@@ -15,6 +15,7 @@ Core invariant these tests pin:
   never left to resolve against whatever the process cwd happens to be.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -293,6 +294,37 @@ def test_write_file_reports_resolved_absolute_path(_isolated_cwd, monkeypatch):
     assert out.get("resolved_path") == expected
     assert out.get("files_modified") == [expected]
     assert (workspace / "newfile.txt").read_text() == "hello\n"
+
+
+def test_delegation_scoped_file_writes_reject_external_absolute_paths(tmp_path):
+    workspace = tmp_path / "workspace-boundary"
+    outside = tmp_path / "outside-boundary"
+    workspace.mkdir()
+    outside.mkdir()
+    target = outside / "escape.txt"
+    target.write_text("old")
+    task_id = "delegation-boundary"
+    terminal_tool.register_task_env_overrides(task_id, {
+        "cwd": str(workspace),
+        "_delegation_workspace_scoped": True,
+    })
+    try:
+        write_result = json.loads(ft._handle_write_file(
+            {"path": str(target), "content": "new"}, task_id=task_id,
+        ))
+        patch_result = json.loads(ft._handle_patch(
+            {
+                "mode": "replace", "path": str(target),
+                "old_string": "old", "new_string": "new",
+            },
+            task_id=task_id,
+        ))
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)
+
+    assert "delegation workspace" in write_result["error"].lower()
+    assert "delegation workspace" in patch_result["error"].lower()
+    assert target.read_text() == "old"
 
 
 def test_patch_reports_resolved_absolute_path(_isolated_cwd, monkeypatch):

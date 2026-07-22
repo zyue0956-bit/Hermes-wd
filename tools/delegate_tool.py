@@ -25,10 +25,11 @@ import os
 import threading
 import time
 from concurrent.futures import (
+    Future,
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from toolsets import TOOLSETS
 
@@ -45,6 +46,7 @@ from utils import base_url_hostname, is_truthy_value
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
+        "delegation_control",  # no global lifecycle control from children
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
@@ -119,7 +121,9 @@ def _get_subagent_approval_callback():
 # toolset to request explicitly — the correct mechanism for nested
 # delegation is role='orchestrator', which re-adds "delegation" in
 # _build_child_agent regardless of this exclusion.
-_EXCLUDED_TOOLSET_NAMES = frozenset({"debugging", "safe", "delegation", "moa", "rl"})
+_EXCLUDED_TOOLSET_NAMES = frozenset(
+    {"debugging", "safe", "delegation", "delegation_control", "moa", "rl"}
+)
 _SUBAGENT_TOOLSETS = sorted(
     name
     for name, defn in TOOLSETS.items()
@@ -156,6 +160,7 @@ _MIN_SPAWN_DEPTH = 1
 
 _spawn_pause_lock = threading.Lock()
 _spawn_paused: bool = False
+_spawn_paused_sessions: set[str] = set()
 
 _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
@@ -163,21 +168,27 @@ _active_subagents_lock = threading.Lock()
 _active_subagents: Dict[str, Dict[str, Any]] = {}
 
 
-def set_spawn_paused(paused: bool) -> bool:
-    """Globally block/unblock new delegate_task spawns.
-
-    Active children keep running; only NEW calls to delegate_task fail fast
-    with a "spawning paused" error until unblocked.  Returns the new state.
-    """
+def set_spawn_paused(
+    paused: bool, session_key: Optional[str] = None
+) -> bool:
+    """Block/unblock spawns globally or for one owning session."""
     global _spawn_paused
     with _spawn_pause_lock:
-        _spawn_paused = bool(paused)
-        return _spawn_paused
+        if session_key is None:
+            _spawn_paused = bool(paused)
+            return _spawn_paused
+        if paused:
+            _spawn_paused_sessions.add(session_key)
+        else:
+            _spawn_paused_sessions.discard(session_key)
+        return session_key in _spawn_paused_sessions
 
 
-def is_spawn_paused() -> bool:
+def is_spawn_paused(session_key: Optional[str] = None) -> bool:
     with _spawn_pause_lock:
-        return _spawn_paused
+        return _spawn_paused or (
+            session_key is not None and session_key in _spawn_paused_sessions
+        )
 
 
 def _register_subagent(record: Dict[str, Any]) -> None:
@@ -739,41 +750,232 @@ def _build_child_system_prompt(
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Best-effort local workspace hint for child prompts.
+    """Resolve the same task-aware workspace root used by file tools."""
+    try:
+        from pathlib import Path
+        from tools.approval import get_current_session_key
+        from tools.file_tools import _authoritative_workspace_root
 
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
+        raw_task_id = getattr(parent_agent, "_current_task_id", None)
+        task_id = (
+            raw_task_id
+            if isinstance(raw_task_id, str) and raw_task_id
+            else get_current_session_key(default="") or "default"
+        )
+        raw_workspace = _authoritative_workspace_root(task_id)
+        if not raw_workspace:
+            return None
+        workspace = Path(raw_workspace).expanduser().resolve()
+    except Exception:
+        logger.warning("Failed to resolve authoritative delegation workspace", exc_info=True)
+        return None
+
+    return str(workspace) if workspace.is_dir() else None
+
+
+_READ_ONLY_WORKSPACE_TOOLSETS = frozenset({
+    "web", "search", "x_search", "browser", "vision", "video",
+    "session_search", "maps",
+})
+
+
+def _resolve_workspace_mode(
+    task_list: List[Dict[str, Any]],
+    default_toolsets: Optional[List[str]] = None,
+) -> str:
+    """Conservatively classify a delegation as read-only or workspace-writing.
+
+    Inherited/unknown toolsets are treated as write-capable. This intentionally
+    biases toward preventing concurrent repository corruption rather than
+    maximising fan-out.
     """
-    candidates = [
-        os.getenv("TERMINAL_CWD"),
-        getattr(
-            getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
-        ),
-        getattr(parent_agent, "terminal_cwd", None),
-        getattr(parent_agent, "cwd", None),
-    ]
-    for candidate in candidates:
-        if not candidate:
+    for task in task_list:
+        task_toolsets = task.get("toolsets") or default_toolsets
+        if not task_toolsets:
+            return "write"
+        if any(name not in _READ_ONLY_WORKSPACE_TOOLSETS for name in task_toolsets):
+            return "write"
+    return "read"
+
+
+def _build_delegation_activity_fn(children: List[Any]) -> Callable[[], Dict[str, Any]]:
+    """Aggregate child-native activity summaries for the async registry."""
+    def _activity() -> Dict[str, Any]:
+        summaries: List[Dict[str, Any]] = []
+        total_api_calls = 0
+        for child in children:
+            try:
+                summary = child.get_activity_summary() or {}
+            except Exception:
+                continue
+            if not isinstance(summary, dict):
+                continue
+            summaries.append(summary)
+            calls = summary.get("api_call_count", 0)
+            if isinstance(calls, (int, float)):
+                total_api_calls += int(calls)
+        if not summaries:
+            return {}
+        latest = max(
+            summaries,
+            key=lambda item: float(item.get("last_activity_ts") or 0.0),
+        )
+        return {
+            "last_activity_ts": latest.get("last_activity_ts"),
+            "last_activity_desc": latest.get("last_activity_desc"),
+            "current_tool": latest.get("current_tool"),
+            "api_call_count": total_api_calls,
+        }
+
+    return _activity
+
+
+def _register_child_workspace_override(child: Any, workspace_path: Optional[str]) -> None:
+    """Bind a child task id to the exact workspace protected by the lock."""
+    child_task_id = getattr(child, "_subagent_id", None)
+    if not workspace_path or not isinstance(child_task_id, str) or not child_task_id:
+        return
+    from tools.terminal_tool import register_task_env_overrides
+
+    register_task_env_overrides(
+        child_task_id,
+        {
+            "cwd": workspace_path,
+            "_delegation_workspace_scoped": True,
+        },
+    )
+    child._delegate_workspace_task_id = child_task_id
+
+
+def _clear_child_workspace_override(child: Any) -> None:
+    """Idempotently release a child workspace override on every exit path."""
+    child_task_id = getattr(child, "_delegate_workspace_task_id", None)
+    if not isinstance(child_task_id, str) or not child_task_id:
+        return
+    try:
+        from tools.terminal_tool import clear_task_env_overrides
+
+        clear_task_env_overrides(child_task_id)
+    finally:
+        child._delegate_workspace_task_id = None
+
+
+def _teardown_rejected_children(
+    children: List[Any], parent_agent: Any, *, reason: str
+) -> None:
+    """Close pre-built children and emit lifecycle completion on admission rejection."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+    except Exception:
+        invoke_hook = None
+
+    for child in children:
+        progress_cb = getattr(child, "tool_progress_callback", None)
+        if callable(progress_cb):
+            try:
+                progress_cb(
+                    "subagent.complete",
+                    preview=reason,
+                    status="rejected",
+                    duration_seconds=0,
+                    summary=reason,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to emit rejected completion for child %s",
+                    getattr(child, "session_id", "<unknown>"),
+                    exc_info=True,
+                )
+        if invoke_hook is not None:
+            try:
+                invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                    child_session_id=getattr(child, "session_id", None),
+                    child_role=getattr(child, "_delegate_role", None),
+                    child_summary=reason,
+                    child_status="rejected",
+                    duration_ms=0,
+                )
+            except Exception:
+                logger.warning("Rejected subagent_stop hook failed", exc_info=True)
+
+        try:
+            _clear_child_workspace_override(child)
+        except Exception:
+            logger.warning(
+                "Failed to clear rejected child workspace override",
+                exc_info=True,
+            )
+        active_children = getattr(parent_agent, "_active_children", None)
+        if isinstance(active_children, list):
+            active_lock = getattr(parent_agent, "_active_children_lock", None)
+            try:
+                if active_lock is not None:
+                    with active_lock:
+                        active_children.remove(child)
+                else:
+                    active_children.remove(child)
+            except ValueError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Failed to remove rejected child from parent lifecycle",
+                    exc_info=True,
+                )
+        close = getattr(child, "close", None)
+        if not callable(close):
+            logger.warning(
+                "Rejected child %s has no close() method",
+                getattr(child, "session_id", "<unknown>"),
+            )
             continue
         try:
-            text = os.path.abspath(os.path.expanduser(str(candidate)))
+            close()
         except Exception:
-            continue
-        if os.path.isabs(text) and os.path.isdir(text):
-            return text
-    return None
+            logger.warning("Failed to close child after workspace rejection", exc_info=True)
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """Remove toolsets that contain only blocked tools."""
     blocked_toolset_names = {
         "delegation",
+        "delegation_control",
         "clarify",
         "memory",
         "code_execution",
     }
     return [t for t in toolsets if t not in blocked_toolset_names]
+
+
+_BLOCKED_CHILD_TOOL_NAMES = frozenset({"skill_manage"})
+
+
+def _remove_blocked_child_tools(child: Any) -> None:
+    """Remove profile-global persistent write tools from delegated agents."""
+    valid = getattr(child, "valid_tool_names", None)
+    if isinstance(valid, set):
+        valid.difference_update(_BLOCKED_CHILD_TOOL_NAMES)
+    elif isinstance(valid, list):
+        child.valid_tool_names = [
+            name for name in valid if name not in _BLOCKED_CHILD_TOOL_NAMES
+        ]
+
+    schemas = getattr(child, "tools", None)
+    if isinstance(schemas, list):
+        def _schema_name(schema: Any) -> Optional[str]:
+            if not isinstance(schema, dict):
+                return None
+            function = schema.get("function")
+            if isinstance(function, dict):
+                return function.get("name")
+            return schema.get("name")
+
+        child.tools = [
+            schema for schema in schemas
+            if _schema_name(schema) not in _BLOCKED_CHILD_TOOL_NAMES
+        ]
 
 
 def _build_child_progress_callback(
@@ -1248,6 +1450,7 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    _remove_blocked_child_tools(child)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -1459,7 +1662,167 @@ def _dump_subagent_timeout_diagnostic(
         return None
 
 
+class _InlineExecutor:
+    """Context-compatible executor used when batch worker startup is unavailable."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def submit(self, fn, /, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # Future preserves worker semantics.
+            future.set_exception(exc)
+        return future
+
+
+def _create_resilient_batch_executor(max_workers: int):
+    """Return a fully prewarmed pool, or a safe inline fallback."""
+    try:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+    except Exception:
+        logger.warning(
+            "Batch executor construction failed; falling back to inline execution",
+            exc_info=True,
+        )
+        return _InlineExecutor()
+
+    release = threading.Event()
+    ready_condition = threading.Condition()
+    ready_count = 0
+
+    def _warm_worker() -> None:
+        nonlocal ready_count
+        with ready_condition:
+            ready_count += 1
+            ready_condition.notify_all()
+        release.wait()
+
+    futures = []
+    try:
+        for _ in range(max_workers):
+            futures.append(executor.submit(_warm_worker))
+        deadline = time.monotonic() + 5.0
+        with ready_condition:
+            while ready_count < max_workers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Timed out while prewarming batch executor")
+                ready_condition.wait(timeout=remaining)
+    except Exception:
+        release.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+        logger.warning(
+            "Batch executor prewarm failed; falling back to inline execution",
+            exc_info=True,
+        )
+        return _InlineExecutor()
+    finally:
+        release.set()
+
+    try:
+        for future in futures:
+            future.result(timeout=5)
+    except Exception:
+        executor.shutdown(wait=True, cancel_futures=True)
+        logger.warning(
+            "Batch executor warm-up failed; falling back to inline execution",
+            exc_info=True,
+        )
+        return _InlineExecutor()
+    return executor
+
+
+def _fail_safe_preflight_teardown(child: Any, parent_agent: Any) -> None:
+    """Best-effort cleanup when child startup fails before the main finally."""
+    subagent_id = getattr(child, "_subagent_id", None)
+    if isinstance(subagent_id, str) and subagent_id:
+        try:
+            _unregister_subagent(subagent_id)
+        except Exception:
+            logger.warning("Failed to unregister preflight child", exc_info=True)
+
+    try:
+        _clear_child_workspace_override(child)
+    except Exception:
+        logger.warning("Failed to clear preflight workspace override", exc_info=True)
+
+    active_lease = getattr(child, "_delegate_active_lease", None)
+    if isinstance(active_lease, tuple) and len(active_lease) == 2:
+        pool, lease_id = active_lease
+        try:
+            pool.release_lease(lease_id)
+        except Exception:
+            logger.warning("Failed to release preflight credential lease", exc_info=True)
+        finally:
+            setattr(child, "_delegate_active_lease", None)
+
+    active_children = getattr(parent_agent, "_active_children", None)
+    if isinstance(active_children, list):
+        lock = getattr(parent_agent, "_active_children_lock", None)
+        try:
+            if lock is not None:
+                with lock:
+                    active_children.remove(child)
+            else:
+                active_children.remove(child)
+        except ValueError:
+            pass
+        except Exception:
+            logger.warning("Failed to remove preflight child ownership", exc_info=True)
+
+    try:
+        import model_tools
+
+        saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
+        if isinstance(saved_tool_names, list):
+            model_tools._last_resolved_tool_names = list(saved_tool_names)
+    except Exception:
+        logger.warning("Failed to restore tools after preflight failure", exc_info=True)
+
+    try:
+        close = getattr(child, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        logger.warning("Failed to close child after preflight failure", exc_info=True)
+
+
 def _run_single_child(
+    task_index: int,
+    goal: str,
+    child=None,
+    parent_agent=None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """Fail-safe wrapper covering exceptions before the inner main try/finally."""
+    try:
+        return _run_single_child_impl(
+            task_index=task_index,
+            goal=goal,
+            child=child,
+            parent_agent=parent_agent,
+            **kwargs,
+        )
+    except Exception as exc:
+        logger.exception("Subagent preflight failed before lifecycle activation")
+        _fail_safe_preflight_teardown(child, parent_agent)
+        return {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "api_calls": 0,
+            "duration_seconds": 0,
+            "_child_role": getattr(child, "_delegate_role", None),
+        }
+
+
+def _run_single_child_impl(
     task_index: int,
     goal: str,
     child=None,
@@ -1488,12 +1851,17 @@ def _run_single_child(
     if child_pool is not None:
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
-            try:
-                leased_entry = child_pool.current()
-                if leased_entry is not None and hasattr(child, "_swap_credential"):
-                    child._swap_credential(leased_entry)
-            except Exception as exc:
-                logger.debug("Failed to bind child to leased credential: %s", exc)
+            setattr(child, "_delegate_active_lease", (child_pool, leased_cred_id))
+            get_leased = getattr(child_pool, "get_leased_credential", None)
+            if not callable(get_leased):
+                raise RuntimeError("Credential pool lacks exact leased-entry lookup")
+            leased_entry = get_leased(leased_cred_id)
+            if leased_entry is None:
+                raise RuntimeError("Leased credential could not be resolved by ID")
+            swap_credential = getattr(child, "_swap_credential", None)
+            if not callable(swap_credential):
+                raise RuntimeError("Child cannot bind its leased credential")
+            swap_credential(leased_entry)
 
     # Heartbeat: periodically propagate child activity to the parent so the
     # gateway inactivity timeout doesn't fire while the subagent is working.
@@ -1748,6 +2116,15 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            # A timed-out child may ignore cooperative interrupt and keep using
+            # file/terminal tools. Do not return (and therefore do not release
+            # its workspace lease/override) until the actual worker exits.
+            if is_timeout and not _child_future.done():
+                try:
+                    _child_future.result()
+                except Exception:
+                    pass
+
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
@@ -1760,9 +2137,9 @@ def _run_single_child(
                 "diagnostic_path": diagnostic_path,
             }
         finally:
-            # Shut down executor without waiting — if the child thread
-            # is stuck on blocking I/O, wait=True would hang forever.
-            _timeout_executor.shutdown(wait=False)
+            # Worker completion is a hard lifecycle boundary: workspace leases,
+            # cwd overrides and child resources cannot be released beforehand.
+            _timeout_executor.shutdown(wait=True)
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, "_flush"):
@@ -1996,37 +2373,44 @@ def _run_single_child(
         }
 
     finally:
-        # Stop the heartbeat thread so it doesn't keep touching parent activity
-        # after the child has finished (or failed).  Guard the join: .start()
-        # now lives inside the try block, so if it raised (OS thread
-        # exhaustion) the thread was never started and Thread.join() would
-        # raise RuntimeError.  ident is None until start() succeeds.
-        _heartbeat_stop.set()
-        if _heartbeat_thread.ident is not None:
-            _heartbeat_thread.join(timeout=5)
+        # Every teardown step is independently guarded: a failed workspace
+        # cleanup must never block credential release, parent ownership removal,
+        # or child.close().
+        try:
+            _heartbeat_stop.set()
+            if _heartbeat_thread.ident is not None:
+                _heartbeat_thread.join(timeout=5)
+        except Exception:
+            logger.warning("Failed to stop child heartbeat", exc_info=True)
 
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
-            _unregister_subagent(_subagent_id)
+            try:
+                _unregister_subagent(_subagent_id)
+            except Exception:
+                logger.warning("Failed to unregister child lifecycle", exc_info=True)
+
+        try:
+            _clear_child_workspace_override(child)
+        except Exception:
+            logger.warning("Failed to clear child workspace override", exc_info=True)
 
         if child_pool is not None and leased_cred_id is not None:
             try:
                 child_pool.release_lease(leased_cred_id)
             except Exception as exc:
                 logger.debug("Failed to release credential lease: %s", exc)
+            finally:
+                setattr(child, "_delegate_active_lease", None)
 
-        # Restore the parent's tool names so the process-global is correct
-        # for any subsequent execute_code calls or other consumers.
-        import model_tools
+        try:
+            import model_tools
 
-        saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
-        if isinstance(saved_tool_names, list):
-            model_tools._last_resolved_tool_names = list(saved_tool_names)
+            saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
+            if isinstance(saved_tool_names, list):
+                model_tools._last_resolved_tool_names = list(saved_tool_names)
+        except Exception:
+            logger.warning("Failed to restore parent tool registry", exc_info=True)
 
-        # Remove child from active tracking
-
-        # Unregister child from interrupt propagation
         if hasattr(parent_agent, "_active_children"):
             try:
                 lock = getattr(parent_agent, "_active_children_lock", None)
@@ -2035,17 +2419,20 @@ def _run_single_child(
                         parent_agent._active_children.remove(child)
                 else:
                     parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError) as e:
-                logger.debug("Could not remove child from active_children: %s", e)
+            except ValueError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Failed to remove child from active lifecycle", exc_info=True
+                )
 
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
         try:
             if hasattr(child, "close"):
                 child.close()
         except Exception:
-            logger.debug("Failed to close child agent after delegation")
+            logger.debug(
+                "Failed to close child agent after delegation", exc_info=True
+            )
 
 
 def _recover_tasks_from_json_string(
@@ -2100,10 +2487,38 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
-    # Operator-controlled kill switch — lets the TUI freeze new fan-out
-    # when a runaway tree is detected, without interrupting already-running
-    # children.  Cleared via the matching `delegation.pause` RPC.
-    if is_spawn_paused():
+    try:
+        from tools.approval import get_current_session_key
+
+        caller_session_key = get_current_session_key(default="")
+    except Exception:
+        caller_session_key = ""
+
+    _async_ok = False
+    if background:
+        try:
+            from gateway.session_context import async_delivery_supported
+
+            _async_ok = bool(async_delivery_supported())
+        except Exception:
+            # A detached result without a verified delivery route is unsafe;
+            # degrade to the synchronous path instead of guessing.
+            _async_ok = False
+        if _async_ok and not caller_session_key:
+            return json.dumps(
+                {
+                    "error": (
+                        "Background delegation requires a non-empty owning "
+                        "session key; dispatch was rejected."
+                    ),
+                    "reason_code": "session_owner_unavailable",
+                },
+                ensure_ascii=False,
+            )
+
+    # The operator gate is global; LLM delegation_control pauses only its own
+    # session so one chat cannot block every other gateway tenant.
+    if is_spawn_paused(caller_session_key):
         return tool_error(
             "Delegation spawning is paused. Clear the pause via the TUI "
             "(`p` in /agents) or the `delegation.pause` RPC before retrying."
@@ -2199,6 +2614,16 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    _workspace_mode = _resolve_workspace_mode(
+        task_list, default_toolsets=toolsets
+    )
+    _workspace_path = _resolve_workspace_hint(parent_agent)
+    if background and _workspace_mode == "write" and not _workspace_path:
+        return tool_error(
+            "Write delegation requires an authoritative workspace; dispatch was "
+            "rejected because the task/session cwd could not be resolved."
+        )
+
     overall_start = time.monotonic()
     results = []
 
@@ -2249,9 +2674,30 @@ def delegate_task(
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+    except Exception:
+        _teardown_rejected_children(
+            [child for _, _, child in children],
+            parent_agent,
+            reason="Child construction failed.",
+        )
+        raise
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
+
+    # Child file/terminal tools use the stable subagent id as their task id.
+    # Register the parent's authoritative workspace under every child id so the
+    # path protected by the async lock is exactly the path children resolve.
+    try:
+        for _, _, child in children:
+            _register_child_workspace_override(child, _workspace_path)
+    except Exception:
+        _teardown_rejected_children(
+            [child for _, _, child in children],
+            parent_agent,
+            reason="Failed to inherit parent workspace.",
+        )
+        raise
 
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -2273,16 +2719,29 @@ def delegate_task(
             completed_count = 0
             spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-            with ThreadPoolExecutor(max_workers=max_children) as executor:
+            with _create_resilient_batch_executor(
+                min(max_children, n_tasks)
+            ) as executor:
                 futures = {}
                 for i, t, child in children:
-                    future = executor.submit(
-                        _run_single_child,
-                        task_index=i,
-                        goal=t["goal"],
-                        child=child,
-                        parent_agent=parent_agent,
-                    )
+                    run_kwargs = {
+                        "task_index": i,
+                        "goal": t["goal"],
+                        "child": child,
+                        "parent_agent": parent_agent,
+                    }
+                    try:
+                        future = executor.submit(_run_single_child, **run_kwargs)
+                    except Exception:
+                        logger.warning(
+                            "Batch child submit failed; executing child inline",
+                            exc_info=True,
+                        )
+                        future = Future()
+                        try:
+                            future.set_result(_run_single_child(**run_kwargs))
+                        except BaseException as exc:
+                            future.set_exception(exc)
                     futures[future] = i
 
                 # Poll futures with interrupt checking.  as_completed() blocks
@@ -2497,7 +2956,6 @@ def delegate_task(
     # keep chatting, get the combined summaries back together at the end.
     if background:
         from tools.async_delegation import dispatch_async_delegation_batch
-        from tools.approval import get_current_session_key
 
         # Stateless request/response sessions (the API server / WebUI path)
         # cannot route a detached subagent result back to the agent after the
@@ -2507,11 +2965,6 @@ def delegate_task(
         # work still runs and its result returns in this same response, which is
         # strictly better than a handle that never resolves. Mirrors the
         # pool-at-capacity inline fallback below.
-        try:
-            from gateway.session_context import async_delivery_supported
-            _async_ok = async_delivery_supported()
-        except Exception:
-            _async_ok = True
         if not _async_ok:
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
@@ -2527,36 +2980,36 @@ def delegate_task(
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
-        _session_key = get_current_session_key(default="")
+        _session_key = caller_session_key
         _child_agents = [c for (_, _, c) in children]
-
-        # Detach every child from the parent's interrupt-propagation list — the
-        # batch's lifecycle is owned by the async registry now, not the parent
-        # turn. _build_child_agent attached them (correct for sync runs).
-        if hasattr(parent_agent, "_active_children"):
-            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
-            for _c in _child_agents:
-                try:
-                    if _ac_lock:
-                        with _ac_lock:
-                            parent_agent._active_children.remove(_c)
-                    else:
-                        parent_agent._active_children.remove(_c)
-                except ValueError:
-                    pass
+        _activity_fn = _build_delegation_activity_fn(_child_agents)
 
         def _batch_runner():
             return _execute_and_aggregate()
 
         def _batch_interrupt():
+            failures: List[str] = []
+            interrupted = 0
             for _c in _child_agents:
                 try:
-                    if hasattr(_c, "interrupt"):
-                        _c.interrupt("Async delegation cancelled")
+                    interrupt = getattr(_c, "interrupt", None)
+                    if callable(interrupt):
+                        interrupt("Async delegation cancelled")
                     elif hasattr(_c, "_interrupt_requested"):
                         _c._interrupt_requested = True
-                except Exception:
-                    pass
+                    else:
+                        raise RuntimeError("interrupt unavailable")
+                    interrupted += 1
+                except Exception as exc:
+                    failures.append(type(exc).__name__)
+            if failures:
+                kinds = ", ".join(sorted(set(failures)))
+                raise RuntimeError(
+                    f"Failed to interrupt {len(failures)}/{len(_child_agents)} "
+                    f"subagents ({kinds})"
+                )
+            if interrupted == 0:
+                raise RuntimeError("No active subagent accepted cancellation")
 
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(
@@ -2568,10 +3021,27 @@ def delegate_task(
             session_key=_session_key,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            activity_fn=_activity_fn,
+            workspace_path=_workspace_path,
+            workspace_mode=_workspace_mode,
             max_async_children=_get_max_async_children(),
         )
 
         if dispatch.get("status") == "dispatched":
+            # Ownership transfers only after admission succeeds. Until this
+            # point a capacity/scheduling rejection may fall back to sync and
+            # parent interrupts must still reach every child.
+            if hasattr(parent_agent, "_active_children"):
+                _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+                for _c in _child_agents:
+                    try:
+                        if _ac_lock:
+                            with _ac_lock:
+                                parent_agent._active_children.remove(_c)
+                        else:
+                            parent_agent._active_children.remove(_c)
+                    except ValueError:
+                        pass
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -2595,12 +3065,50 @@ def delegate_task(
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        if dispatch.get("reason_code") in {
+            "workspace_locked", "workspace_unavailable"
+        }:
+            # The async unit never took ownership of these pre-built children.
+            _teardown_rejected_children(
+                _child_agents,
+                parent_agent,
+                reason=dispatch.get("error", "Workspace is locked."),
+            )
+            return json.dumps(
+                {
+                    "error": dispatch.get("error", "Workspace is locked."),
+                    "reason_code": dispatch.get("reason_code"),
+                    "holder_delegation_id": dispatch.get("holder_delegation_id"),
+                    "workspace_path": dispatch.get("workspace_path"),
+                },
+                ensure_ascii=False,
+            )
+
+        if _workspace_mode == "write":
+            # A write-capable task must never fall back to unregistered sync
+            # execution: the async record owns the global write lease, and a
+            # schedule/capacity rejection means no lease covers the real worker.
+            _teardown_rejected_children(
+                _child_agents,
+                parent_agent,
+                reason=dispatch.get(
+                    "error", "Write delegation could not be scheduled safely."
+                ),
+            )
+            return json.dumps(
+                {
+                    "error": dispatch.get(
+                        "error", "Write delegation could not be scheduled safely."
+                    ),
+                    "reason_code": dispatch.get("reason_code", "schedule_failed"),
+                },
+                ensure_ascii=False,
+            )
+
+        # Read-only capacity/schedule rejection keeps the historical synchronous fallback.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
+            "read-only batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
         return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
@@ -2893,11 +3401,11 @@ def _build_top_level_description() -> str:
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
         "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
-        "you and the user keep working, and each subagent's full result "
-        "re-enters the conversation as its own new message when it finishes. A "
-        "batch is just N independent background subagents (N handles, each "
-        "completes on its own). Do NOT wait or poll; just continue with other "
-        "work after dispatching.\n\n"
+        "you and the user keep working. A single task's full result re-enters "
+        "the conversation when it finishes. A batch uses one background handle; "
+        "its subagents run in parallel, wait on each other, and their consolidated "
+        "results re-enter as one message after ALL finish. Do NOT wait or poll; "
+        "just continue with other work after dispatching.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -2928,10 +3436,12 @@ def _build_top_level_description() -> str:
         "status) and verify it yourself — fetch the URL, stat the file, read "
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
-        "delegate_task, clarify, memory, send_message, execute_code.\n"
+        "delegate_task, clarify, memory, send_message, execute_code, or "
+        "skill_manage.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
         "delegate_task so they can spawn their own workers, but still "
-        "cannot use clarify, memory, send_message, or execute_code. "
+        "cannot use clarify, memory, send_message, execute_code, or "
+        "skill_manage. "
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"

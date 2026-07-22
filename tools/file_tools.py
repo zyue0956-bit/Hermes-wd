@@ -211,10 +211,22 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     Returns ``None`` only when there is genuinely no reliable anchor, in which
     case callers fall back to the process cwd.
     """
+    registered = _registered_task_cwd_override(task_id)
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+
+        scoped = (
+            resolve_task_overrides(task_id).get("_delegation_workspace_scoped")
+            is True
+        )
+    except Exception:
+        scoped = False
+    if scoped and registered:
+        return registered
+
     live = _get_live_tracking_cwd(task_id)
     if live:
         return live
-    registered = _registered_task_cwd_override(task_id)
     if registered:
         return registered
     return _configured_terminal_cwd()
@@ -392,6 +404,36 @@ def _get_hermes_config_resolved() -> str | None:
         except Exception:
             _hermes_config_resolved = None
     return _hermes_config_resolved
+
+
+def _delegation_workspace_write_error(
+    filepath: str, task_id: str = "default"
+) -> str | None:
+    """Reject delegated writes that resolve outside their scoped workspace."""
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+
+        overrides = resolve_task_overrides(task_id)
+    except Exception:
+        return None
+    if overrides.get("_delegation_workspace_scoped") is not True:
+        return None
+    root_raw = overrides.get("cwd")
+    root = _sentinel_free_abs_cwd(root_raw)
+    if not root:
+        return "Delegation workspace is unavailable; refusing file write."
+    root_path = Path(root).resolve()
+    target = _resolve_path_for_task(filepath, task_id)
+    try:
+        inside = os.path.commonpath([str(root_path), str(target)]) == str(root_path)
+    except ValueError:
+        inside = False
+    if inside:
+        return None
+    return (
+        f"File write escapes delegation workspace: {target} "
+        f"(workspace: {root_path})"
+    )
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
@@ -1276,6 +1318,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    workspace_err = _delegation_workspace_write_error(path, task_id)
+    if workspace_err:
+        return tool_error(workspace_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1379,6 +1424,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
             _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        workspace_err = _delegation_workspace_write_error(_p, task_id)
+        if workspace_err:
+            return tool_error(workspace_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

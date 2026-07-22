@@ -977,7 +977,12 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     # command has run. Pushing it onto the live env keeps ``cd`` tracking intact
     # while letting an explicit ACP cwd change win, as the client expects.
     new_cwd = overrides.get("cwd")
-    if isinstance(new_cwd, str) and new_cwd.strip():
+    scoped_delegation_cwd = overrides.get("_delegation_workspace_scoped") is True
+    if (
+        isinstance(new_cwd, str)
+        and new_cwd.strip()
+        and not scoped_delegation_cwd
+    ):
         # The live env is cached under the raw task_id for per-session surfaces
         # (ACP/gateway/dashboard) and under the collapsed container id for
         # isolation-keyed rollouts. Try the raw id first, then the container id,
@@ -1821,6 +1826,7 @@ def _resolve_command_cwd(
     workdir: Optional[str],
     env: Any,
     default_cwd: str,
+    scoped_cwd: Optional[str] = None,
 ) -> str:
     """Return the cwd for a command, preferring the live session cwd.
 
@@ -1828,8 +1834,27 @@ def _resolve_command_cwd(
     call. That broke session-local ``cd`` state: the environment tracked the
     new directory in ``env.cwd``, but foreground/background calls kept forcing
     the old cwd back through ``env.execute(..., cwd=...)``. Explicit
-    ``workdir=`` must still override everything.
+    ``workdir=`` overrides normal sessions, but delegated scoped sessions may
+    only select directories inside their authoritative workspace.
     """
+    if isinstance(scoped_cwd, str) and scoped_cwd.strip():
+        scope = os.path.realpath(os.path.abspath(os.path.expanduser(scoped_cwd)))
+        if workdir:
+            requested = os.path.expanduser(workdir)
+            if not os.path.isabs(requested):
+                requested = os.path.join(scope, requested)
+            requested = os.path.realpath(os.path.abspath(requested))
+            try:
+                inside_scope = os.path.commonpath([scope, requested]) == scope
+            except ValueError:
+                inside_scope = False
+            if not inside_scope:
+                raise ValueError(
+                    f"Terminal workdir escapes delegation workspace: {requested} "
+                    f"(workspace: {scope})"
+                )
+            return requested
+        return scope
     if workdir:
         return workdir
 
@@ -1925,6 +1950,9 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
+        scoped_cwd = (
+            cwd if overrides.get("_delegation_workspace_scoped") is True else None
+        )
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -2156,6 +2184,7 @@ def terminal_tool(
                 workdir=workdir,
                 env=env,
                 default_cwd=cwd,
+                scoped_cwd=scoped_cwd,
             )
             try:
                 if env_type == "local":
@@ -2404,6 +2433,7 @@ def terminal_tool(
                             workdir=workdir,
                             env=env,
                             default_cwd=cwd,
+                            scoped_cwd=scoped_cwd,
                         ),
                     }
                     result = env.execute(command, **execute_kwargs)

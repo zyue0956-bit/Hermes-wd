@@ -3715,6 +3715,31 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     ).start()
 
 
+_shell_hooks_registered = False
+_shell_hooks_lock = threading.Lock()
+
+
+def _ensure_shell_hooks() -> None:
+    """Register shell hooks once per process (idempotent, best-effort)."""
+    global _shell_hooks_registered
+    if _shell_hooks_registered:
+        return
+    with _shell_hooks_lock:
+        if _shell_hooks_registered:
+            return
+        try:
+            from hermes_cli.config import load_config
+            from agent.shell_hooks import register_from_config
+
+            register_from_config(load_config(), accept_hooks=False)
+        except Exception:
+            logger.debug(
+                "shell-hook registration failed in TUI gateway",
+                exc_info=True,
+            )
+        _shell_hooks_registered = True
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -3725,6 +3750,8 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
 ):
+    _ensure_shell_hooks()
+
     from run_agent import AIAgent
     from hermes_cli.runtime_provider import resolve_runtime_provider
 

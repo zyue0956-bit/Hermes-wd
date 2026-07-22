@@ -128,12 +128,12 @@ class TestLiveCardManager:
     """Tasks 5-7: LiveCardManager state machine."""
 
     def test_initial_state_is_idle(self):
-        from gateway.platforms.feishu import LiveCardManager, LiveCardState
+        from plugins.platforms.feishu.adapter import LiveCardManager, LiveCardState
         mgr = LiveCardManager()
         assert mgr.state == LiveCardState.IDLE
 
     def test_start_sets_ack_sent(self):
-        from gateway.platforms.feishu import LiveCardManager, LiveCardState
+        from plugins.platforms.feishu.adapter import LiveCardManager, LiveCardState
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         assert mgr.state == LiveCardState.ACK_SENT
@@ -141,7 +141,7 @@ class TestLiveCardManager:
         assert mgr.started_at == 100.0
 
     def test_update_text_transitions_to_live(self):
-        from gateway.platforms.feishu import LiveCardManager, LiveCardState
+        from plugins.platforms.feishu.adapter import LiveCardManager, LiveCardState
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         mgr.update_text("hello")
@@ -149,7 +149,7 @@ class TestLiveCardManager:
         assert mgr.accumulated_text == "hello"
 
     def test_append_tool_line(self):
-        from gateway.platforms.feishu import LiveCardManager, LiveCardState
+        from plugins.platforms.feishu.adapter import LiveCardManager, LiveCardState
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         mgr.append_tool("Read")
@@ -159,7 +159,7 @@ class TestLiveCardManager:
         assert mgr.last_tool == "Read"
 
     def test_append_unknown_tool(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         mgr.append_tool("CustomTool")
@@ -167,7 +167,7 @@ class TestLiveCardManager:
         assert len(mgr.tool_lines) == 1
 
     def test_tool_lines_capped_at_max(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         for i in range(30):
@@ -176,7 +176,7 @@ class TestLiveCardManager:
         assert mgr.tool_lines[0] == "..."
 
     def test_reset_clears_all(self):
-        from gateway.platforms.feishu import LiveCardManager, LiveCardState
+        from plugins.platforms.feishu.adapter import LiveCardManager, LiveCardState
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         mgr.update_text("text")
@@ -188,7 +188,7 @@ class TestLiveCardManager:
         assert mgr.card_message_id is None
 
     def test_reset_cancels_heartbeat(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         mock_task = Mock()
@@ -199,7 +199,7 @@ class TestLiveCardManager:
         assert mgr.heartbeat_task is None
 
     def test_build_card_ack_state(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         card = mgr.build_card(now=105.0)
@@ -207,7 +207,7 @@ class TestLiveCardManager:
         assert "已思考 5s" in md
 
     def test_build_card_live_state_with_text(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=100.0)
         mgr.update_text("analysis result")
@@ -219,7 +219,7 @@ class TestLiveCardManager:
         assert "12s" in md
 
     def test_should_throttle_within_interval(self):
-        from gateway.platforms.feishu import LiveCardManager, MIN_PATCH_INTERVAL
+        from plugins.platforms.feishu.adapter import LiveCardManager, MIN_PATCH_INTERVAL
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=0.0)
         mgr.last_patch_ts = 10.0
@@ -227,13 +227,13 @@ class TestLiveCardManager:
         assert mgr.should_throttle(now=10.0 + MIN_PATCH_INTERVAL + 0.1) is False
 
     def test_should_throttle_never_patched(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=0.0)
         assert mgr.should_throttle(now=0.1) is False
 
     def test_mark_degraded(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=0.0)
         assert mgr.degraded is False
@@ -241,7 +241,7 @@ class TestLiveCardManager:
         assert mgr.degraded is True
 
     def test_build_card_still_works_when_degraded(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=0.0)
         mgr.update_text("some text")
@@ -259,7 +259,7 @@ from gateway.platforms.base import SendResult, ProcessingOutcome
 
 
 def _make_live_card(*, state, msg_id="ack_001", started_at=0.0):
-    from gateway.platforms.feishu import LiveCardManager, LiveCardState
+    from plugins.platforms.feishu.adapter import LiveCardManager, LiveCardState
     mgr = LiveCardManager()
     if state != LiveCardState.IDLE:
         mgr.start(msg_id, started_at=started_at)
@@ -279,7 +279,7 @@ def _make_event(*, chat_id="chat_001", message_id="msg_in_001"):
 
 def _make_adapter():
     """Create a minimal FeishuAdapter-like object for testing live card logic."""
-    from gateway.platforms.feishu import LiveCardManager, LiveCardState
+    from plugins.platforms.feishu.adapter import LiveCardManager, LiveCardState
 
     adapter = Mock()
     adapter._live_cards = {}
@@ -307,7 +307,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_on_processing_start_creates_live_card(self):
-        from gateway.platforms.feishu import (
+        from plugins.platforms.feishu.adapter import (
             FeishuAdapter, LiveCardState, LiveCardManager,
         )
         adapter = _make_adapter()
@@ -323,7 +323,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_on_processing_start_without_card_mode(self):
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
         adapter = _make_adapter()
         adapter._card_mode_enabled = False
 
@@ -334,7 +334,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_send_final_patches_and_cleans_up(self):
-        from gateway.platforms.feishu import (
+        from plugins.platforms.feishu.adapter import (
             FeishuAdapter, LiveCardState, LiveCardManager,
         )
         adapter = _make_adapter()
@@ -353,7 +353,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_edit_message_updates_accumulated_text(self):
-        from gateway.platforms.feishu import (
+        from plugins.platforms.feishu.adapter import (
             FeishuAdapter, LiveCardState, LiveCardManager,
         )
         adapter = _make_adapter()
@@ -370,7 +370,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_edit_message_no_live_card_falls_through(self):
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
         adapter = _make_adapter()
 
         result = await FeishuAdapter.edit_message(
@@ -381,7 +381,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_on_processing_complete_cancels_heartbeat(self):
-        from gateway.platforms.feishu import (
+        from plugins.platforms.feishu.adapter import (
             FeishuAdapter, LiveCardState, LiveCardManager,
         )
         adapter = _make_adapter()
@@ -401,7 +401,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_on_processing_complete_without_live_card(self):
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
         adapter = _make_adapter()
 
         event = _make_event(chat_id="chat_001", message_id="msg_in_001")
@@ -411,7 +411,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_send_non_final_accumulates_and_patches(self):
-        from gateway.platforms.feishu import (
+        from plugins.platforms.feishu.adapter import (
             FeishuAdapter, LiveCardState,
         )
         adapter = _make_adapter()
@@ -431,7 +431,7 @@ class TestFeishuLiveCardIntegration:
 
     @pytest.mark.asyncio
     async def test_send_gateway_heartbeat_passes_through(self):
-        from gateway.platforms.feishu import (
+        from plugins.platforms.feishu.adapter import (
             FeishuAdapter, LiveCardState,
         )
         adapter = _make_adapter()
@@ -453,7 +453,7 @@ class TestRecordPatchResult:
     """Consecutive-failure degradation via record_patch_result."""
 
     def test_success_resets_counter(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=0.0)
         mgr.record_patch_result(False)
@@ -464,7 +464,7 @@ class TestRecordPatchResult:
         assert not mgr.degraded
 
     def test_three_failures_triggers_degradation(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=0.0)
         mgr.record_patch_result(False)
@@ -474,7 +474,7 @@ class TestRecordPatchResult:
         assert mgr.degraded
 
     def test_intermittent_failure_does_not_degrade(self):
-        from gateway.platforms.feishu import LiveCardManager
+        from plugins.platforms.feishu.adapter import LiveCardManager
         mgr = LiveCardManager()
         mgr.start("msg_001", started_at=0.0)
         mgr.record_patch_result(False)
@@ -486,7 +486,7 @@ class TestRecordPatchResult:
 
     @pytest.mark.asyncio
     async def test_edit_message_degrades_after_consecutive_failures(self):
-        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        from plugins.platforms.feishu.adapter import FeishuAdapter, LiveCardState
         adapter = _make_adapter()
         adapter._patch_card = AsyncMock(
             return_value=SendResult(success=False, error="network error")
@@ -507,7 +507,7 @@ class TestLiveCardDegradation:
 
     @pytest.mark.asyncio
     async def test_degraded_send_uses_original_path(self):
-        from gateway.platforms.feishu import (
+        from plugins.platforms.feishu.adapter import (
             FeishuAdapter, LiveCardState,
         )
         adapter = _make_adapter()
@@ -531,7 +531,7 @@ class TestPatchLiveCardThrottled:
 
     @pytest.mark.asyncio
     async def test_patch_throttled_skips_when_recent(self):
-        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        from plugins.platforms.feishu.adapter import FeishuAdapter, LiveCardState
         adapter = _make_adapter()
         live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
         live.last_patch_ts = time.monotonic()
@@ -542,7 +542,7 @@ class TestPatchLiveCardThrottled:
 
     @pytest.mark.asyncio
     async def test_patch_throttled_patches_when_stale(self):
-        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        from plugins.platforms.feishu.adapter import FeishuAdapter, LiveCardState
         adapter = _make_adapter()
         live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
         live.last_patch_ts = 0.0
@@ -553,7 +553,7 @@ class TestPatchLiveCardThrottled:
 
     @pytest.mark.asyncio
     async def test_patch_throttled_noop_when_degraded(self):
-        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        from plugins.platforms.feishu.adapter import FeishuAdapter, LiveCardState
         adapter = _make_adapter()
         live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
         live.mark_degraded()
@@ -564,7 +564,7 @@ class TestPatchLiveCardThrottled:
 
     @pytest.mark.asyncio
     async def test_patch_throttled_noop_when_idle(self):
-        from gateway.platforms.feishu import FeishuAdapter, LiveCardState, LiveCardManager
+        from plugins.platforms.feishu.adapter import FeishuAdapter, LiveCardState, LiveCardManager
         adapter = _make_adapter()
         live = LiveCardManager()
         adapter._live_cards["chat_001"] = live
@@ -574,7 +574,7 @@ class TestPatchLiveCardThrottled:
 
     @pytest.mark.asyncio
     async def test_patch_throttled_records_failure(self):
-        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        from plugins.platforms.feishu.adapter import FeishuAdapter, LiveCardState
         adapter = _make_adapter()
         adapter._patch_card = AsyncMock(
             return_value=SendResult(success=False, error="network")
@@ -587,7 +587,7 @@ class TestPatchLiveCardThrottled:
         assert live._consecutive_failures == 1
 
     def test_on_tool_progress_appends_tool(self):
-        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        from plugins.platforms.feishu.adapter import FeishuAdapter, LiveCardState
         adapter = _make_adapter()
         live = _make_live_card(state=LiveCardState.ACK_SENT, msg_id="ack_001")
         adapter._live_cards["chat_001"] = live
@@ -599,7 +599,7 @@ class TestPatchLiveCardThrottled:
         assert "阅读文件" in live.tool_lines[0]
 
     def test_on_tool_progress_skips_degraded(self):
-        from gateway.platforms.feishu import FeishuAdapter, LiveCardState
+        from plugins.platforms.feishu.adapter import FeishuAdapter, LiveCardState
         adapter = _make_adapter()
         live = _make_live_card(state=LiveCardState.LIVE, msg_id="ack_001")
         live.mark_degraded()
@@ -609,7 +609,7 @@ class TestPatchLiveCardThrottled:
         assert len(live.tool_lines) == 0
 
     def test_on_tool_progress_skips_no_live_card(self):
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
         adapter = _make_adapter()
         adapter._live_cards = {}
         # Should not raise
@@ -621,7 +621,7 @@ class TestFullLifecycle:
 
     @pytest.mark.asyncio
     async def test_full_lifecycle(self):
-        from gateway.platforms.feishu import (
+        from plugins.platforms.feishu.adapter import (
             FeishuAdapter, LiveCardState,
         )
         adapter = _make_adapter()
